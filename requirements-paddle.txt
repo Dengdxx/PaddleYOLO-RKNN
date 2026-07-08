@@ -1,0 +1,34 @@
+# PaddleYOLO-RKNN Paddle training and ONNX export dependencies.
+#
+# Install:
+#   conda create -n pdrk python=3.12 -y
+#   conda activate pdrk
+#   pip install -r requirements-paddle.txt
+#
+# paddle2onnx==2.1.0 is required for Paddle 3 PIR export. If its Windows
+# cp312 wheel fails to load, use this same file in a Linux/WSL pdrk env for
+# Paddle->ONNX, then pass the ONNX to requirements-rknn.txt.
+
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu130/
+
+# Deep learning
+setuptools<81
+paddlepaddle-gpu==3.3.1
+torch==2.4.0
+
+# Base dependencies
+numpy==1.26.4
+protobuf==4.25.4
+opencv-python==4.11.0.86
+onnx>=1.16.1,<=1.17.0
+onnxslim>=0.1.0
+paddle2onnx==2.1.0
+pillow>=10.0.0
+pyyaml>=6.0
+tqdm>=4.65.0
+psutil>=5.9.0
+seaborn>=0.13.0
+pandas>=2.0.0
+polars>=1.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0

@@ -1,0 +1,123 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Modifications Copyright (C) 2026 Dengdxx <dengdx@tju.edu.cn>
+
+# YOLO 训练、验证、推理与导出的全局默认配置。
+# 配置用法见仓库 README 与 docs 目录。
+
+task: detect # (str) YOLO 任务类型：detect 或 segment
+mode: train # (str) YOLO 运行模式：train、val、predict、export、benchmark
+
+# Train settings -------------------------------------------------------------------------------------------------------
+model: # (str, optional) 模型文件路径，如 weights/yolov8/yolov8n.pdparams 或 yolov8n.yaml
+data: # (str, optional) 数据集配置文件路径，如 coco8.yaml
+epochs: 100 # (int) 训练轮数
+time: # (float, optional) 最大训练小时数；设置后会覆盖 epochs
+patience: 100 # (int) 验证指标连续 N 轮无提升时提前停止
+batch: 16 # (int | float) batch 大小；也可用 0.0-1.0 表示 AutoBatch 占用显存比例
+imgsz: 640 # (int | list) train/val 使用正方形 int；predict/export 可使用 [h,w]
+save: True # (bool) 保存训练检查点和推理结果
+save_period: -1 # (int) 每 N 轮保存检查点；小于 1 表示关闭
+cache: False # (bool | str) 缓存图片到 RAM(True/'ram') 或 'disk'；False 表示关闭
+device: # (int | str | list) 设备：0、[0,1,2,3]、'cpu'/'mps'，或 -1/[-1,-1] 自动选择空闲 GPU
+workers: 8 # (int) dataloader 线程数；DDP 下为每个 RANK 的线程数
+project: # (str, optional) 结果根目录名
+name: # (str, optional) 实验名；结果保存到 'project/name'
+exist_ok: False # (bool) 为 True 时允许覆盖已有 'project/name'
+pretrained: True # (bool | str) 是否使用预训练权重，或指定权重路径
+optimizer: auto # (str) 优化器：SGD、MuSGD、Adam、Adamax、AdamW、NAdam、RAdam、RMSProp 或 auto
+verbose: True # (bool) 训练/验证期间输出详细日志
+seed: 0 # (int) 随机种子，便于复现
+deterministic: True # (bool) 启用确定性算子；更易复现但可能变慢
+single_cls: False # (bool) 将所有类别视为单类别训练
+rect: False # (bool) train 使用矩形 batch；mode='val' 时 val 默认矩形 batch
+cos_lr: False # (bool) 使用余弦学习率调度
+close_mosaic: 10 # (int) 最后 N 轮关闭 mosaic 增强；0 表示不关闭
+resume: False # (bool) 从 run 目录中的 last checkpoint 恢复训练
+amp: True # (bool) 自动混合精度训练；True 时会先做 AMP 能力检查
+fraction: 1.0 # (float) 使用训练集比例；1.0 表示全部数据
+profile: False # (bool) 训练中为日志系统 profile ONNX/TensorRT 速度
+freeze: # (int | list, optional) 冻结前 N 层，或指定层索引列表
+multi_scale: 0.0 # (float) 多尺度训练范围，按 imgsz 比例设置；尺寸会对齐到 stride 倍数
+compile: False # (bool | str) 支持时启用 Paddle 静态图编译；False 表示关闭
+
+# Segmentation
+overlap_mask: True # (bool) 训练时将实例掩码合并到一张 mask（仅 segment）
+mask_ratio: 4 # (int) mask 下采样比例（仅 segment）
+
+# Val/Test settings ----------------------------------------------------------------------------------------------------
+val: True # (bool) 训练期间执行验证/测试
+split: val # (str) 评估的数据集划分：'val'、'test' 或 'train'
+save_json: False # (bool) 保存 COCO JSON 结果供外部评估
+conf: # (float, optional) 置信度阈值；默认 predict=0.25，val=0.001
+iou: 0.7 # (float) NMS 使用的 IoU 阈值
+max_det: 300 # (int) 每张图最多保留检测数
+half: False # (bool) 支持时使用 FP16 半精度
+dnn: False # (bool) 使用 OpenCV DNN 运行 ONNX 推理
+plots: True # (bool) 训练/验证期间保存图表和图片
+end2end: # (bool, optional) predict/val/export 时是否使用 end2end head（YOLO26、YOLOv10）
+
+# Predict settings -----------------------------------------------------------------------------------------------------
+source: # (str, optional) 图片/视频输入源，可为路径、目录、URL、流；如 'ddyolo26/assets' 或摄像头 '0'
+vid_stride: 1 # (int) 视频源每 N 帧读取一帧
+stream_buffer: False # (bool) True 缓存所有帧；False 只保留最新帧以降低延迟
+visualize: False # (bool) 可视化模型特征（predict）或 TP/FP/FN 混淆（val）
+augment: False # (bool) 推理时启用测试时增强
+agnostic_nms: False # (bool) 使用类别无关 NMS
+classes: # (int | list[int], optional) 按类别 id 过滤，如 0 或 [0,2,3]
+retina_masks: False # (bool) 使用高分辨率分割 mask（segment）
+embed: # (list[int], optional) 返回指定层索引的特征嵌入
+
+# Visualize settings ---------------------------------------------------------------------------------------------------
+show: False # (bool) 支持时在窗口中显示图片/视频
+save_frames: False # (bool) 保存视频预测的单帧图片
+save_txt: False # (bool) 将结果保存为 .txt（xywh 格式）
+save_conf: False # (bool) 在结果中保存置信度
+save_crop: False # (bool) 保存裁剪出的预测区域
+show_labels: True # (bool) 在图上绘制类别标签，如 'person'
+show_conf: True # (bool) 在图上绘制置信度，如 '0.99'
+show_boxes: True # (bool) 在图上绘制边界框
+line_width: # (int, optional) 框线宽；未设置时按图像尺寸自动缩放
+
+# Export settings ------------------------------------------------------------------------------------------------------
+format: onnx # (str) 目标格式，如 onnx|engine|rknn
+keras: False # (bool) 预留兼容参数；当前导出主线未使用
+optimize: False # (bool) 预留参数；Paddle-only 导出未使用
+int8: False # (bool) 支持时启用 INT8/PTQ（engine）；需要校准数据/fraction
+dynamic: False # (bool) ONNX/engine 动态形状；允许可变图像尺寸
+simplify: True # (bool) 仅 ONNX/engine；运行图简化，便于后续 runtime 转换
+opset: # (int, optional) 仅 ONNX/engine；导出 opset 版本；留空使用验证过的默认值
+workspace: # (float, optional) 仅 engine(TensorRT)；workspace 大小 GiB，如 4
+nms: False # (bool) 后端支持时将 NMS 融入导出模型；True 时 conf/iou 生效（coreml 除外）
+dual_raw: False # (bool) 仅 ONNX；导出原始双/四输出（boxes/scores[/mask_coeff/proto]），用于 INT8 主线 pre_dist / pre_dfl / seg_pre_dist
+
+# Hyperparameters ------------------------------------------------------------------------------------------------------
+lr0: 0.01 # (float) 初始学习率（SGD=1e-2，Adam/AdamW=1e-3）
+lrf: 0.01 # (float) 最终学习率比例；最终 LR = lr0 * lrf
+momentum: 0.937 # (float) SGD momentum 或 Adam beta1
+weight_decay: 0.0005 # (float) 权重衰减（L2 正则）
+warmup_epochs: 3.0 # (float) warmup 轮数，可使用小数
+warmup_momentum: 0.8 # (float) warmup 初始 momentum
+warmup_bias_lr: 0.1 # (float) warmup 阶段 bias 学习率
+box: 7.5 # (float) box loss 权重
+cls: 0.5 # (float) 分类 loss 权重
+dfl: 1.5 # (float) distribution focal loss 权重
+nbs: 64 # (int) 用于 loss 归一化的名义 batch size
+hsv_h: 0.015 # (float) HSV hue 增强比例
+hsv_s: 0.7 # (float) HSV saturation 增强比例
+hsv_v: 0.4 # (float) HSV value/brightness 增强比例
+degrees: 0.0 # (float) 旋转角度范围 (+/-)
+translate: 0.1 # (float) 平移比例范围 (+/-)
+scale: 0.5 # (float) 缩放增益范围 (+/-)
+shear: 0.0 # (float) 剪切角度范围 (+/-)
+perspective: 0.0 # (float) 透视变换比例（典型值 0-0.001）
+flipud: 0.0 # (float) 垂直翻转概率
+fliplr: 0.5 # (float) 水平翻转概率
+bgr: 0.0 # (float) RGB/BGR 通道互换概率
+mosaic: 1.0 # (float) mosaic 增强概率
+mixup: 0.0 # (float) MixUp 增强概率
+cutmix: 0.0 # (float) CutMix 增强概率
+copy_paste: 0.0 # (float) 分割 copy-paste 概率
+copy_paste_mode: flip # (str) 分割 copy-paste 策略：flip 或 mixup
+
+# Custom config.yaml ---------------------------------------------------------------------------------------------------
+cfg: # (str, optional) 覆盖默认配置的 config.yaml 路径

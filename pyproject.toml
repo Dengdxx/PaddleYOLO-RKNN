@@ -1,0 +1,45 @@
+# PaddleYOLO-RKNN project metadata only.
+# This file is intentionally not configured as an installable package entry.
+
+[project]
+name = "ddyolo26"
+version = "1.0.0"
+description = "PaddlePaddle-based YOLO detection and segmentation toolkit for RKNN deployment."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Dengdxx", email = "dengdx@tju.edu.cn" }]
+keywords = ["yolo", "paddlepaddle", "object-detection", "instance-segmentation", "computer-vision"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/Dengdxx/PaddleYOLO-RKNN"
+Issues = "https://github.com/Dengdxx/PaddleYOLO-RKNN/issues"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = false
+
+[tool.ruff.lint]
+# Keep the default CI gate narrow for this research/deployment repo:
+# formatting is enforced by `ruff format`, while lint blocks syntax and
+# undefined-name class errors without forcing broad style churn.
+select = ["E9", "F63", "F7", "F82"]

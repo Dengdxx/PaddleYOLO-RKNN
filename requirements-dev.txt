@@ -1,0 +1,7 @@
+# PaddleYOLO-RKNN development tooling
+#
+# Runtime / export dependencies live in requirements-paddle.txt and
+# requirements-rknn.txt. This file is for local quality checks and CI jobs
+# that should not install the GPU/RKNN stack.
+
+ruff==0.15.20

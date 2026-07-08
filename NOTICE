@@ -1,0 +1,83 @@
+PaddleYOLO-RKNN Notice
+======================
+
+This project contains modified source files derived from the Ultralytics YOLO
+codebase.
+
+Upstream attribution reference
+------------------------------
+
+This repository keeps attribution for source derived from Ultralytics YOLO.
+The upstream package metadata for `ultralytics` version `8.4.41` lists:
+
+- Authors: Glenn Jocher <glenn.jocher@ultralytics.com>,
+  Jing Qiu <jing.qiu@ultralytics.com>
+- Maintainer: Ultralytics <hello@ultralytics.com>
+- License: AGPL-3.0
+
+The corresponding upstream file header format is:
+
+`# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license`
+
+Attribution policy in this repository
+-------------------------------------
+
+- Files under `ddyolo26/` are treated as derivative works of Ultralytics YOLO
+  unless listed below as project-specific original files. Derivative files
+  retain the upstream AGPL notice at file top.
+- Modifications in this repository are additionally marked as:
+  `Modifications Copyright (C) 2026 Dengdxx <dengdx@tju.edu.cn>`
+- Project-specific original files use the repository copyright header:
+  `Copyright (C) 2026 Dengdxx <dengdx@tju.edu.cn>` and
+  `SPDX-License-Identifier: AGPL-3.0-only`.
+
+Substantive modifications under `ddyolo26/` (AGPL §5(a))
+--------------------------------------------------------
+
+The following files contain non-trivial modifications relative to upstream
+Ultralytics 8.4.41. Trivial changes (PaConvert-generated symbol renames,
+header banners, log message localization) are not enumerated. Use
+`grep -rn "Modifications Copyright (C) 2026 Dengdxx" ddyolo26/` for the
+full per-file list.
+
+- `ddyolo26/__init__.py` — package re-export surface narrowed to detect/segment.
+- `ddyolo26/nn/tasks.py` — `load_checkpoint` rewritten for Paddle state-dict
+  loading; `nc` injection fix to recover model class count from checkpoint.
+- `ddyolo26/nn/autobackend.py` — Paddle checkpoint loading and ONNX/RKNN
+  inference adapted for this fork; `.pt` (PyTorch) load path replaced by
+  Paddle loader.
+- `ddyolo26/nn/modules/head.py` — `Detect` / `Segment` / `Segment26` extended
+  with `export_dual_raw` switch and `_forward_export` paths for RKNN INT8.
+- `ddyolo26/nn/modules/conv.py`, `block.py`, `activation.py`, `utils.py` —
+  PyTorch ops translated to Paddle equivalents; activation fusion adjusted.
+- `ddyolo26/engine/exporter.py` — ONNX/RKNN/TensorRT export paths adapted for
+  Paddle weights; unsupported upstream export formats are not documented as
+  public deployment routes.
+- `ddyolo26/engine/predictor.py`, `validator.py`, `model.py`, `results.py` —
+  Paddle device handling and tensor type adaptation.
+- `ddyolo26/data/{base,augment,loaders,utils,split,__init__}.py` —
+  dataloader / tensor calls translated to Paddle.
+- `ddyolo26/utils/downloads.py` — Paddle-only local weight resolution and
+  generic dataset/resource download helpers.
+
+Project-specific original files
+-------------------------------
+
+- `ddyolo26/paddle_utils.py` — Paddle/PyTorch compatibility shim for
+  PaConvert output and Paddle runtime API gaps.
+- `ddyolo26/version.py` — PaddleYOLO-RKNN version metadata.
+- `ddyolo26/utils/runtime.py` — compatibility re-export for the Paddle runtime
+  helper module.
+
+- `train.py` and `tools/eval/` —
+  Paddle/ONNX/RKNN unified evaluation harness with RGB calibration fix.
+- `tools/fix_paddle_onnx.py` — Paddle ONNX graph compatibility utility.
+- `export/`, `quant/`, `scripts/`, `bench/` — RK3588 export, quantization,
+  board-side benchmarking and NEON tail microbench.
+
+License
+-------
+
+- This repository is distributed under the GNU AGPL-3.0. See `LICENSE`.
+- For Ultralytics licensing details, including commercial licensing, see:
+  https://ultralytics.com/license

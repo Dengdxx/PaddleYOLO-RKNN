@@ -1,0 +1,31 @@
+# PaddleYOLO-RKNN Linux/WSL RKNN export dependencies.
+#
+# Handles ONNX->RKNN only. Produce ONNX in the Paddle environment from
+# requirements-paddle.txt. RKNN Toolkit2 publishes Linux wheels only, so use
+# Ubuntu/WSL for this environment.
+# Recommended:
+#   conda create -n rknn python=3.12 -y
+#   conda activate rknn
+#   pip install -r requirements-rknn.txt
+
+# RKNN Toolkit2 support dependencies
+torch==2.4.0
+
+# Base dependencies constrained for RKNN Toolkit2
+numpy==1.26.4
+protobuf==4.25.4
+opencv-python==4.11.0.86
+pillow>=10.0.0
+pyyaml>=6.0
+tqdm>=4.65.0
+psutil>=5.9.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+
+# ONNX input handling
+onnx==1.16.1
+onnxruntime>=1.16.0
+
+# RKNN conversion
+rknn-toolkit2==2.3.2
