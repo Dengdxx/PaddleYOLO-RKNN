@@ -219,7 +219,7 @@ class PaddleNMS:
 
     @staticmethod
     def nms(boxes: paddle.Tensor, scores: paddle.Tensor, iou_threshold: float) -> paddle.Tensor:
-        """支持提前终止且 suppression 行为稳定的 optimized NMS。
+        """使用 Paddle 原生算子执行标准 NMS。
 
         参数:
             boxes (paddle.Tensor): xyxy format、shape 为 (N, 4) 的 bounding boxes。
@@ -237,31 +237,7 @@ class PaddleNMS:
         """
         if boxes.size == 0:
             return paddle.empty((0,), dtype=paddle.int64, device=boxes.device)
-        x1, y1, x2, y2 = boxes.unbind(1)
-        areas = (x2 - x1) * (y2 - y1)
-        order = scores.argsort(0, descending=True)
-        keep = paddle.zeros(order.size, dtype=paddle.int64, device=boxes.device)
-        keep_idx = 0
-        while order.size > 0:
-            i = order[0]
-            keep[keep_idx] = i
-            keep_idx += 1
-            if order.size == 1:
-                break
-            rest = order[1:]
-            xx1 = paddle.maximum(x1[i], x1[rest])
-            yy1 = paddle.maximum(y1[i], y1[rest])
-            xx2 = paddle.minimum(x2[i], x2[rest])
-            yy2 = paddle.minimum(y2[i], y2[rest])
-            w = (xx2 - xx1).clamp_(min=0)
-            h = (yy2 - yy1).clamp_(min=0)
-            inter = w * h
-            if inter.sum() == 0:
-                order = rest
-                continue
-            iou = inter / (areas[i] + areas[rest] - inter)
-            order = rest[iou <= iou_threshold]
-        return keep[:keep_idx]
+        return paddle.vision.ops.nms(boxes, iou_threshold, scores=scores)
 
     @staticmethod
     def batched_nms(
