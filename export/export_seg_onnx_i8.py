@@ -7,7 +7,7 @@
 @details
 该脚本用于 `scripts/export_all_models.py` 的跨 conda 环境导出：
 1. 根据输入权重自动导出或复用 seg ONNX；
-2. 裁剪到 `seg_pre_dist` 四输出或 `seg_pre_dfl` 五输出主线；
+2. 裁剪到统一五输出的 `seg_pre_dist` 或 `seg_pre_dfl` 主线；
 3. 使用 ONNX Runtime 静态量化生成 INT8 ONNX。
 """
 
@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="一步导出 seg INT8 ONNX（seg_pre_dist / seg_pre_dfl）")
     p.add_argument("--weights", required=True, help="输入权重路径（.pdparams / onnx）")
+    p.add_argument("--route", choices=["seg_predist", "seg_predfl"], help="要求的部署 route；不匹配时拒绝导出")
     p.add_argument("--data", required=True, help="校准数据集 YAML")
     p.add_argument("--imgsz", type=int, default=640, help="输入尺寸")
     p.add_argument("--output", default="", help="输出 INT8 ONNX 路径；默认与输入模型同目录")
@@ -81,6 +82,9 @@ def main() -> int:
     weights_path = str(Path(args.weights).resolve())
     route, prepared_path, cleanup = prepare_seg_onnx_i8_input(weights_path, args.imgsz, auto_export_onnx)
     try:
+        public_route = _route_tag(route)
+        if args.route and args.route != public_route:
+            raise ValueError(f"请求 route={args.route}，但模型实际为 {public_route}")
         prepared_output = Path(args.prepared_output).resolve() if args.prepared_output else None
         if prepared_output is None and args.skip_quant:
             prepared_output = default_prepared_output_path(weights_path, route, args.imgsz)
@@ -94,7 +98,6 @@ def main() -> int:
             return 0
 
         import onnx as _onnx
-        import numpy as _np
         from onnxruntime.quantization import (
             CalibrationDataReader,
             QuantFormat,
@@ -124,14 +127,10 @@ def main() -> int:
                 break
             imgs = batch["img"].astype("float32") / 255.0
             if imgs.shape[2] != in_h or imgs.shape[3] != in_w:
-                import cv2
-
-                resized = []
-                for j in range(imgs.shape[0]):
-                    img = imgs[j].transpose(1, 2, 0)
-                    img = cv2.resize(img, (in_w, in_h))
-                    resized.append(img.transpose(2, 0, 1))
-                imgs = _np.stack(resized)
+                raise ValueError(
+                    f"校准预处理尺寸 {imgs.shape[2:]} 与 ONNX 输入 {(in_h, in_w)} 不一致；"
+                    "禁止用拉伸 resize 修补校准数据"
+                )
             cached.append(imgs)
 
         class _DR(CalibrationDataReader):

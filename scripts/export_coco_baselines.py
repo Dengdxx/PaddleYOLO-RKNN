@@ -21,11 +21,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_BASELINES_ROOT = ROOT / "artifacts" / "coco_baselines"
 DEFAULT_DATA = ROOT / "ddyolo26" / "cfg" / "datasets" / "coco-val2017-only.yaml"
 EXPORT_ALL_PY = ROOT / "scripts" / "export_all_models.py"
@@ -74,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default=str(DEFAULT_DATA), help="COCO data.yaml")
     p.add_argument("--only", default="", help="仅处理某个模型目录")
     p.add_argument("--python-paddle", default="", help="paddle/ddyolo26 路线使用的 Python 可执行文件")
+    p.add_argument("--python-rknn", default="", help="RKNN Toolkit 路线使用的 Python 可执行文件")
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--calib-images", type=int, default=50)
     p.add_argument("--skip-rknn", action="store_true", help="仅导出 ONNX，跳过 RKNN")
@@ -83,6 +88,103 @@ def parse_args() -> argparse.Namespace:
 def run(cmd: list[str]) -> None:
     log("$ " + " ".join(str(c) for c in cmd))
     subprocess.run(cmd, cwd=str(ROOT), check=True)
+
+
+def file_sha256(path: Path) -> str:
+    """计算输入文件 SHA-256，作为导出缓存来源指纹。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pipeline_sha256() -> str:
+    """计算 COCO 入口及共享导出流水线的完整代码指纹。"""
+    from scripts.export_all_models import pipeline_sha256 as shared_pipeline_sha256
+
+    digest = hashlib.sha256()
+    digest.update(file_sha256(Path(__file__)).encode("ascii"))
+    digest.update(shared_pipeline_sha256().encode("ascii"))
+    return digest.hexdigest()
+
+
+def calibration_sha256(data_yaml: Path, calib_images: int, calib_offset: int) -> str:
+    """哈希实际选中的 RKNN 校准图片及数据集描述。"""
+    from export.export_rknn import collect_calib_images
+
+    digest = hashlib.sha256()
+    digest.update(file_sha256(data_yaml).encode("ascii"))
+    for image_path in collect_calib_images(str(data_yaml), calib_images, offset=calib_offset):
+        path = Path(image_path)
+        digest.update(str(path).encode("utf-8"))
+        digest.update(file_sha256(path).encode("ascii"))
+    return digest.hexdigest()
+
+
+def rknn_environment_identity(python_exe: str) -> dict[str, str]:
+    """读取 RKNN 解释器和 Toolkit 版本，避免跨环境误复用缓存。"""
+    code = (
+        "import importlib.metadata,json,platform; "
+        "\ntry:\n v=importlib.metadata.version('rknn-toolkit2')\nexcept importlib.metadata.PackageNotFoundError:\n v='missing'\n"
+        "print(json.dumps({'python':platform.python_version(),'rknn_toolkit2':v}))"
+    )
+    result = subprocess.run(
+        [python_exe, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def rknn_provenance(
+    weights: Path,
+    data_yaml: Path,
+    imgsz: int,
+    calib_images: int,
+    calib_offset: int,
+    algorithm: str,
+    route: str,
+    python_exe: str,
+    auto_hybrid: bool | None = None,
+) -> dict:
+    """构造覆盖模型、校准输入、环境和完整代码的 RKNN 缓存指纹。"""
+    provenance = {
+        "schema": 2,
+        "weights_sha256": file_sha256(weights),
+        "calibration_sha256": calibration_sha256(data_yaml, calib_images, calib_offset),
+        "imgsz": imgsz,
+        "calib_images": calib_images,
+        "calib_offset": calib_offset,
+        "algorithm": algorithm,
+        "route": route,
+        "python": str(Path(python_exe).resolve()),
+        "environment": rknn_environment_identity(python_exe),
+        "pipeline_sha256": pipeline_sha256(),
+    }
+    if auto_hybrid is not None:
+        provenance["auto_hybrid"] = auto_hybrid
+    return provenance
+
+
+def provenance_matches(output: Path, inputs: dict) -> bool:
+    """仅在产物及其来源参数指纹完全一致时复用缓存。"""
+    metadata = output.with_suffix(output.suffix + ".json")
+    if not output.exists() or not metadata.exists():
+        return False
+    try:
+        return json.loads(metadata.read_text(encoding="utf-8")) == inputs
+    except (OSError, ValueError):
+        return False
+
+
+def write_provenance(output: Path, inputs: dict) -> None:
+    """原子写入产物来源参数指纹。"""
+    metadata = output.with_suffix(output.suffix + ".json")
+    temporary = metadata.with_suffix(metadata.suffix + ".tmp")
+    temporary.write_text(json.dumps(inputs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(metadata)
 
 
 def model_dir(root: Path, name: str) -> Path:
@@ -160,17 +262,32 @@ def export_det_rknn(
     algorithm: str,
     auto_hybrid: bool,
     python_exe: str,
+    route: str,
     calib_offset: int = 0,
 ) -> None:
-    """调用检测 RKNN INT8 专用导出脚本；目标文件已存在时直接复用。"""
-    if out_path.exists():
-        log(f"复用已存在 RKNN: {out_path.name}")
+    """调用检测 RKNN INT8 专用导出脚本；仅复用来源指纹一致的产物。"""
+    provenance = rknn_provenance(
+        weights,
+        data_yaml,
+        imgsz,
+        calib_images,
+        calib_offset,
+        algorithm,
+        route,
+        python_exe,
+        auto_hybrid=auto_hybrid,
+    )
+    if provenance_matches(out_path, provenance):
+        log(f"复用来源一致的 RKNN: {out_path.name}")
         return
+    out_path.unlink(missing_ok=True)
     cmd = [
         python_exe,
         str(EXPORT_DET_RKNN_PY),
         "--weights",
         str(weights),
+        "--route",
+        str(provenance["route"]),
         "--data",
         str(data_yaml),
         "--imgsz",
@@ -187,6 +304,7 @@ def export_det_rknn(
     if auto_hybrid:
         cmd.append("--auto-hybrid")
     run(cmd)
+    write_provenance(out_path, provenance)
 
 
 def export_seg_rknn(
@@ -197,18 +315,32 @@ def export_seg_rknn(
     calib_images: int,
     algorithm: str,
     python_exe: str,
+    route: str,
     calib_offset: int = 0,
 ) -> None:
-    """调用分割 RKNN INT8 专用导出脚本；目标文件已存在时直接复用。"""
-    if out_path.exists():
-        log(f"复用已存在 RKNN: {out_path.name}")
+    """调用分割 RKNN INT8 专用导出脚本；仅复用来源指纹一致的产物。"""
+    provenance = rknn_provenance(
+        weights,
+        data_yaml,
+        imgsz,
+        calib_images,
+        calib_offset,
+        algorithm,
+        route,
+        python_exe,
+    )
+    if provenance_matches(out_path, provenance):
+        log(f"复用来源一致的 RKNN: {out_path.name}")
         return
+    out_path.unlink(missing_ok=True)
     run(
         [
             python_exe,
             str(EXPORT_SEG_RKNN_PY),
             "--weights",
             str(weights),
+            "--route",
+            route,
             "--data",
             str(data_yaml),
             "--imgsz",
@@ -223,6 +355,7 @@ def export_seg_rknn(
             str(out_path),
         ]
     )
+    write_provenance(out_path, provenance)
 
 
 def main() -> int:
@@ -231,6 +364,7 @@ def main() -> int:
     root = Path(args.root).resolve()
     data_yaml = Path(args.data).resolve()
     paddle_python = str(Path(args.python_paddle).resolve()) if args.python_paddle else sys.executable
+    rknn_python = str(Path(args.python_rknn).resolve()) if args.python_rknn else sys.executable
     if not data_yaml.exists():
         raise SystemExit(f"未找到 data.yaml: {data_yaml}")
     root.mkdir(parents=True, exist_ok=True)
@@ -265,7 +399,8 @@ def main() -> int:
                 args.calib_images,
                 cfg["rknn_algorithm"],
                 bool(cfg["auto_hybrid"]),
-                paddle_python,
+                rknn_python,
+                cfg["route"],
                 calib_offset=1000,
             )
         else:
@@ -276,7 +411,8 @@ def main() -> int:
                 args.imgsz,
                 args.calib_images,
                 cfg["rknn_algorithm"],
-                paddle_python,
+                rknn_python,
+                cfg["route"],
                 calib_offset=1000,
             )
 

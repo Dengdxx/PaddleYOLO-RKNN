@@ -21,10 +21,11 @@ import numpy as np
 import paddle
 
 from ddyolo26.models.yolo.detect import DetectionValidator
+from ddyolo26.models.yolo.segment.predict import _decode_rknn_seg_five_outputs, _is_seg_five_outputs
 from ddyolo26.utils import LOGGER, ops
-from ddyolo26.utils.plotting import plot_images
 from ddyolo26.utils.checks import check_requirements
 from ddyolo26.utils.metrics import SegmentMetrics, mask_iou
+from ddyolo26.utils.plotting import plot_images
 
 
 class SegmentationValidator(DetectionValidator):
@@ -75,6 +76,7 @@ class SegmentationValidator(DetectionValidator):
             model (paddle.nn.Layer): 待验证的模型。
         """
         super().init_metrics(model)
+        self._rknn_backend = bool(getattr(model, "rknn", False))
         if self.args.save_json:
             check_requirements("faster-coco-eval>=1.6.7")
         self.process = ops.process_mask_native if self.args.save_json or self.args.save_txt else ops.process_mask
@@ -104,8 +106,28 @@ class SegmentationValidator(DetectionValidator):
         返回:
             (list[dict[str, paddle.Tensor]]): 处理后的检测结果字典列表，含 masks。
         """
-        proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
-        preds = super().postprocess(preds[0])
+        if getattr(self, "_rknn_backend", False):
+            if not _is_seg_five_outputs(preds):
+                count = len(preds) if isinstance(preds, (list, tuple)) else type(preds).__name__
+                raise ValueError(f"RKNN 分割模型必须返回五输出，实际 {count}")
+            detections, proto = _decode_rknn_seg_five_outputs(
+                preds,
+                self.args.imgsz,
+                self.args.conf,
+                self.args.iou,
+                self.args.max_det,
+            )
+            preds = [
+                {
+                    "bboxes": detections[:, :4],
+                    "conf": detections[:, 4],
+                    "cls": detections[:, 5],
+                    "extra": detections[:, 6:],
+                }
+            ]
+        else:
+            proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
+            preds = super().postprocess(preds[0])
         imgsz = [4 * x for x in proto.shape[2:]]
         for i, pred in enumerate(preds):
             coefficient = pred.pop("extra")

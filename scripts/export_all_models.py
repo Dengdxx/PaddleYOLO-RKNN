@@ -31,6 +31,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +49,176 @@ def log(msg: str) -> None:
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     log("$ " + " ".join(str(c) for c in cmd))
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+
+
+def file_sha256(path: Path) -> str:
+    """计算文件内容指纹。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pipeline_sha256() -> str:
+    """计算导出实现指纹，使代码变化自动失效旧缓存。"""
+    digest = hashlib.sha256()
+    paths = [
+        Path(__file__),
+        ROOT / "quant" / "quantize.py",
+        ROOT / "tools" / "eval" / "backend_utils.py",
+        *sorted((ROOT / "export").glob("*.py")),
+    ]
+    for path in paths:
+        digest.update(str(path.relative_to(ROOT)).encode("utf-8"))
+        digest.update(file_sha256(path).encode("ascii"))
+    return digest.hexdigest()
+
+
+def rknn_environment_identity(python_exe: str) -> dict[str, str]:
+    """读取 RKNN Python 与 Toolkit 版本，避免环境原位升级后误用缓存。"""
+    code = (
+        "import importlib.metadata,json,platform; "
+        "\ntry:\n v=importlib.metadata.version('rknn-toolkit2')\n"
+        "except importlib.metadata.PackageNotFoundError:\n v='missing'\n"
+        "print(json.dumps({'python':platform.python_version(),'rknn_toolkit2':v}))"
+    )
+    result = subprocess.run(
+        [python_exe, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def calibration_sha256(data_yaml: Path, imgsz: int, calib_images: int, mode: str) -> str:
+    """哈希实际校准输入，避免数据替换后复用旧量化产物。"""
+    digest = hashlib.sha256()
+    digest.update(file_sha256(data_yaml).encode("ascii"))
+    if mode == "onnx":
+        from quant.quantize import build_calib_loader
+
+        batches, _ = build_calib_loader(str(data_yaml), imgsz, batch=1, n_batches=calib_images)
+        for batch in batches:
+            image = batch["img"]
+            digest.update(str(image.shape).encode("ascii"))
+            digest.update(image.tobytes())
+    elif mode == "rknn":
+        from export.export_rknn import collect_calib_images
+
+        for image_path in collect_calib_images(str(data_yaml), calib_images):
+            path = Path(image_path)
+            digest.update(str(path).encode("utf-8"))
+            digest.update(file_sha256(path).encode("ascii"))
+    else:
+        raise ValueError(f"未知校准指纹模式: {mode}")
+    return digest.hexdigest()
+
+
+def cache_matches(target: Path, provenance: dict) -> bool:
+    """仅在产物与来源指纹都存在且完全一致时复用。"""
+    sidecar = target.with_suffix(target.suffix + ".json")
+    if not target.exists() or not sidecar.exists():
+        return False
+    try:
+        return json.loads(sidecar.read_text(encoding="utf-8")) == provenance
+    except (OSError, ValueError):
+        return False
+
+
+def write_cache_provenance(target: Path, provenance: dict) -> None:
+    """原子写入导出产物来源指纹。"""
+    sidecar = target.with_suffix(target.suffix + ".json")
+    temporary = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    temporary.write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(sidecar)
+
+
+def export_provenance(
+    source: Path,
+    data_yaml: Path,
+    route: str,
+    imgsz: int,
+    calib_images: int,
+    python_exe: str,
+    calibration_mode: str,
+) -> dict:
+    """构造影响 INT8/RKNN 产物的稳定来源指纹。"""
+    provenance = {
+        "schema": 1,
+        "source_sha256": file_sha256(source),
+        "calibration_mode": calibration_mode,
+        "calibration_sha256": calibration_sha256(data_yaml, imgsz, calib_images, calibration_mode),
+        "route": route,
+        "imgsz": imgsz,
+        "calib_images": calib_images,
+        "python": str(Path(python_exe).resolve()),
+        "pipeline_sha256": pipeline_sha256(),
+    }
+    if calibration_mode == "rknn":
+        provenance["environment"] = rknn_environment_identity(python_exe)
+    return provenance
+
+
+def route_onnx_provenance(source: Path, route: str, imgsz: int, python_exe: str) -> dict:
+    """构造 FP32 route ONNX 的来源指纹。"""
+    return {
+        "schema": 1,
+        "source_sha256": file_sha256(source),
+        "route": route,
+        "imgsz": imgsz,
+        "python": str(Path(python_exe).resolve()),
+        "pipeline_sha256": pipeline_sha256(),
+    }
+
+
+def is_prepared_seg_onnx(path: Path, python_exe: str, expected_route: str) -> bool:
+    """!
+    @brief 检查已有分割 ONNX 是否满足统一五输出部署契约。
+    @param path 待检查的 ONNX 路径。
+    @param python_exe 提供 ONNX 依赖的 Python 可执行文件。
+    @return 严格满足 `seg_pre_dist / seg_pre_dfl` 五输出契约时返回 true。
+    """
+    code = (
+        "import sys, onnx; "
+        "from export.seg_onnx_routes import detect_prepared_seg_route; "
+        "route=detect_prepared_seg_route(onnx.load(sys.argv[1])); "
+        "expected={'seg_predist':'seg_pre_dist','seg_predfl':'seg_pre_dfl'}[sys.argv[2]]; "
+        "assert route == expected, f'实际 route={route}, 期望 route={expected}'"
+    )
+    result = subprocess.run(
+        [python_exe, "-c", code, str(path), expected_route],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    detail = result.stderr.strip().splitlines()
+    reason = detail[-1] if detail else "输出契约检查失败"
+    log(f"已有分割 ONNX 不是五输出，将重建: {path.name} ({reason})")
+    return False
+
+
+def is_prepared_det_onnx(path: Path, python_exe: str, expected_route: str) -> bool:
+    """验证检测 ONNX 的实际 route 与请求一致。"""
+    code = (
+        "import sys, onnx; "
+        "from export.det_onnx_routes import detect_prepared_det_onnx_i8_route; "
+        "route=detect_prepared_det_onnx_i8_route(onnx.load(sys.argv[1])); "
+        "expected={'predist':'pre_dist','predfl':'pre_dfl'}[sys.argv[2]]; "
+        "assert route == expected, f'实际 route={route}, 期望 route={expected}'"
+    )
+    result = subprocess.run(
+        [python_exe, "-c", code, str(path), expected_route],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def resolve_python(path: str | None) -> str:
@@ -113,9 +285,11 @@ def step_fp32_onnx(
     """
     fp32_label = fp32_label_for_route(route)
     target = out_dir / f"{base_stem}_{framework}_{fp32_label}_fp32_{imgsz}.onnx"
-    if target.exists():
-        log(f"FP32 ONNX 已存在，跳过: {target.name}")
+    provenance = route_onnx_provenance(weights_path, fp32_label, imgsz, python_exe)
+    if cache_matches(target, provenance):
+        log(f"FP32 ONNX 来源一致，跳过: {target.name}")
         return target
+    target.unlink(missing_ok=True)
     cmd = [
         python_exe,
         str(ROOT / "export" / "export_fp32_onnx.py"),
@@ -127,6 +301,9 @@ def step_fp32_onnx(
         str(target),
     ]
     run(cmd, cwd=ROOT)
+    if not target.exists():
+        raise RuntimeError(f"FP32 ONNX 缺失: {target}")
+    write_cache_provenance(target, provenance)
     log(f"FP32 ONNX → {target.name}")
     return target
 
@@ -153,9 +330,11 @@ def step_int8_onnx_det(
     @brief detection 模型走 quant.quantize.py 生成 INT8 ONNX（pre_dist / pre_dfl）。
     """
     target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.onnx"
-    if target.exists():
-        log(f"INT8 ONNX 已存在，跳过: {target.name}")
+    provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "onnx")
+    if cache_matches(target, provenance) and is_prepared_det_onnx(target, python_exe, route):
+        log(f"INT8 ONNX 来源与 route 一致，跳过: {target.name}")
         return target
+    target.unlink(missing_ok=True)
     cmd = [
         python_exe,
         str(ROOT / "quant" / "quantize.py"),
@@ -163,6 +342,8 @@ def step_int8_onnx_det(
         "onnx",
         "--weights",
         str(src_weights),
+        "--route",
+        route,
         "--data",
         str(data_yaml),
         "--imgsz",
@@ -175,6 +356,9 @@ def step_int8_onnx_det(
     run(cmd, cwd=ROOT)
     if not target.exists():
         raise RuntimeError(f"INT8 ONNX 缺失: {target}")
+    if not is_prepared_det_onnx(target, python_exe, route):
+        raise RuntimeError(f"INT8 ONNX 实际 route 与请求不一致: {target}")
+    write_cache_provenance(target, provenance)
     return target
 
 
@@ -190,17 +374,21 @@ def step_int8_onnx_seg(
     calib_images: int,
 ) -> Path:
     """!
-    @brief segmentation 模型生成 INT8 ONNX (seg_pre_dist/seg_pre_dfl 4 输出 + ORT QDQ 静态量化)。
+    @brief segmentation 模型生成统一五输出的 INT8 ONNX。
     """
     target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.onnx"
-    if target.exists():
+    provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "onnx")
+    if cache_matches(target, provenance) and is_prepared_seg_onnx(target, python_exe, route):
         log(f"INT8 SEG ONNX 已存在，跳过: {target.name}")
         return target
+    target.unlink(missing_ok=True)
     cmd = [
         python_exe,
         str(ROOT / "export" / "export_seg_onnx_i8.py"),
         "--weights",
         str(src_weights),
+        "--route",
+        route,
         "--data",
         str(data_yaml),
         "--imgsz",
@@ -211,6 +399,9 @@ def step_int8_onnx_seg(
         str(calib_images),
     ]
     run(cmd, cwd=ROOT)
+    if not is_prepared_seg_onnx(target, python_exe, route):
+        raise RuntimeError(f"INT8 SEG ONNX 实际 route/输出契约与请求不一致: {target}")
+    write_cache_provenance(target, provenance)
     log(f"INT8 SEG ONNX → {target.name}")
     return target
 
@@ -229,14 +420,18 @@ def step_seg_fp32_route_onnx(
     @brief 为 Seg RKNN 编译准备量化前的 route FP32 ONNX。
     """
     target = out_dir / f"{base_stem}_{framework}_{route}_fp32_{imgsz}.onnx"
-    if target.exists():
+    provenance = route_onnx_provenance(src_weights, route, imgsz, python_exe)
+    if cache_matches(target, provenance) and is_prepared_seg_onnx(target, python_exe, route):
         log(f"FP32 SEG route ONNX 已存在，跳过: {target.name}")
         return target
+    target.unlink(missing_ok=True)
     cmd = [
         python_exe,
         str(ROOT / "export" / "export_seg_onnx_i8.py"),
         "--weights",
         str(src_weights),
+        "--route",
+        route,
         "--data",
         str(data_yaml),
         "--imgsz",
@@ -248,6 +443,9 @@ def step_seg_fp32_route_onnx(
     run(cmd, cwd=ROOT)
     if not target.exists():
         raise RuntimeError(f"FP32 SEG route ONNX 缺失: {target}")
+    if not is_prepared_seg_onnx(target, python_exe, route):
+        raise RuntimeError(f"FP32 SEG ONNX 实际 route/输出契约与请求不一致: {target}")
+    write_cache_provenance(target, provenance)
     log(f"FP32 SEG route ONNX → {target.name}")
     return target
 
@@ -273,9 +471,11 @@ def step_fp32predist_onnx_det(
     @return 输出 ONNX 文件路径。
     """
     target = out_dir / f"{base_stem}_{framework}_{route}_fp32_{imgsz}.onnx"
-    if target.exists():
-        log(f"{route} FP32 ONNX 已存在，跳过: {target.name}")
+    provenance = route_onnx_provenance(weights_path, route, imgsz, python_exe)
+    if cache_matches(target, provenance) and is_prepared_det_onnx(target, python_exe, route):
+        log(f"{route} FP32 ONNX 来源与 route 一致，跳过: {target.name}")
         return target
+    target.unlink(missing_ok=True)
     cmd = [
         python_exe,
         str(ROOT / "export" / "export_predist_fp32_onnx.py"),
@@ -287,6 +487,9 @@ def step_fp32predist_onnx_det(
         str(target),
     ]
     run(cmd, cwd=ROOT)
+    if not is_prepared_det_onnx(target, python_exe, route):
+        raise RuntimeError(f"FP32 detection ONNX 实际 route 与请求不一致: {target}")
+    write_cache_provenance(target, provenance)
     log(f"{route} FP32 ONNX → {target.name}")
     return target
 
@@ -307,15 +510,19 @@ def step_rknn_int8(
     @brief 调用 export_det_rknn_i8 / export_seg_rknn_i8 生成 RKNN INT8。
     """
     target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.rknn"
-    if target.exists():
-        log(f"RKNN INT8 已存在，跳过: {target.name}")
+    provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "rknn")
+    if cache_matches(target, provenance):
+        log(f"RKNN INT8 来源一致，跳过: {target.name}")
         return target
+    target.unlink(missing_ok=True)
     if task == "segment":
         cmd = [
             python_exe,
             str(ROOT / "export" / "export_seg_rknn_i8.py"),
             "--weights",
             str(src_weights),
+            "--route",
+            route,
             "--data",
             str(data_yaml),
             "--imgsz",
@@ -331,6 +538,8 @@ def step_rknn_int8(
             str(ROOT / "export" / "export_det_rknn_i8.py"),
             "--weights",
             str(src_weights),
+            "--route",
+            route,
             "--data",
             str(data_yaml),
             "--imgsz",
@@ -345,6 +554,7 @@ def step_rknn_int8(
     run(cmd, cwd=ROOT)
     if not target.exists():
         raise RuntimeError(f"RKNN 缺失: {target}")
+    write_cache_provenance(target, provenance)
     return target
 
 

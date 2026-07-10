@@ -19,7 +19,9 @@ import argparse
 import inspect
 import os
 import sys
+import tempfile
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,10 +110,14 @@ def _is_paddle_onnx(onnx_model) -> bool:
 
 
 def prepare_onnx(onnx_path: str, fix_paddle: bool = True) -> str:
-    """在进入 RKNN 编译前，修正 Paddle ONNX 并限制 RKNN 支持的 opset。"""
+    """在进入 RKNN 编译前验证 FP32 图、修正 Paddle ONNX 并转换 opset。"""
     import onnx
 
     model = onnx.load(onnx_path)
+    qdq_ops = {"QuantizeLinear", "DequantizeLinear"}
+    present_qdq = sorted({node.op_type for node in model.graph.node} & qdq_ops)
+    if present_qdq:
+        raise ValueError("RKNN 编译入口只接受 FP32 ONNX，检测到 ORT QDQ 节点: " + ", ".join(present_qdq))
     modified = False
 
     if fix_paddle and _is_paddle_onnx(model):
@@ -123,11 +129,19 @@ def prepare_onnx(onnx_path: str, fix_paddle: bool = True) -> str:
         modified = True
         print("[INFO] Paddle ONNX 修复已应用（Expand→Tile, Floor+Cast→Div+Mod）")
 
-    current_opset = model.opset_import[0].version if model.opset_import else 0
+    current_opset = next(
+        (item.version for item in model.opset_import if item.domain in ("", "ai.onnx")),
+        0,
+    )
     if current_opset > 19:
-        print(f"[INFO] 正在降级 ONNX opset {current_opset} → 19")
-        model.opset_import[0].version = 19
+        print(f"[INFO] 正在使用 ONNX version converter 转换 opset {current_opset} → 19")
+        try:
+            model = onnx.version_converter.convert_version(model, 19)
+        except Exception as exc:
+            raise ValueError(f"无法可靠转换 ONNX opset {current_opset} → 19；请从源模型以 opset=13 重新导出") from exc
         modified = True
+
+    onnx.checker.check_model(model)
 
     if modified:
         out_path = str(Path(onnx_path).with_stem(Path(onnx_path).stem + "_rknn_ready"))
@@ -137,22 +151,30 @@ def prepare_onnx(onnx_path: str, fix_paddle: bool = True) -> str:
     return onnx_path
 
 
-def _save_calib_dataset(data_yaml: str, imgsz: int, count: int, offset: int = 0) -> str:
-    """! 收集校准图片并落盘为 RGB 副本，返回 dataset.txt 路径。
+@contextmanager
+def isolated_rknn_workspace():
+    """在临时工作目录中运行 Toolkit，避免 `check*.onnx` 污染仓库。"""
+    original = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="rknn_toolkit_") as workdir:
+        os.chdir(workdir)
+        try:
+            yield Path(workdir)
+        finally:
+            os.chdir(original)
+
+
+def collect_calib_images(data_yaml: str, count: int, offset: int = 0) -> list[str]:
+    """! 按 RKNN 校准规则解析并等距抽取图片。
 
     @param data_yaml 数据集 YAML 路径。
-    @param imgsz 校准输入尺寸（未使用，保留供调用方一致性）。
     @param count 校准图片数量。
     @param offset 起始偏移量，跳过前 N 张图片，用于避免与评测集重叠。
-    @return dataset.txt 路径。
-    @note YOLO26 模型权重训练时使用 RGB（Ultralytics 默认 BGR2RGB），所以
-    RKNN INT8 校准必须喂 RGB；否则 quantize scale 与权重通道错位。详见
-    `tools.eval.backend_utils.make_rgb_calib_dataset` 注释。
+    @return 按最终校准顺序排列的绝对图片路径。
     """
     import yaml
 
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from tools.eval.backend_utils import make_rgb_calib_dataset
+    if count <= 0:
+        raise ValueError("--calib-images 必须大于 0")
 
     with open(data_yaml, encoding="utf-8") as f:
         data = yaml.safe_load(f)
@@ -216,8 +238,39 @@ def _save_calib_dataset(data_yaml: str, imgsz: int, count: int, offset: int = 0)
     if not images:
         raise FileNotFoundError(f"未在 {data_yaml} 中解析到可用校准图片")
 
-    images = images[offset : offset + count]
+    candidates = images[offset:]
+    if not candidates:
+        raise ValueError(f"校准偏移 {offset} 超出数据集范围（共 {len(images)} 张）")
+    sample_count = min(count, len(candidates))
+    if sample_count <= 0:
+        raise ValueError("--calib-images 必须大于 0")
+    if sample_count == 1:
+        images = [candidates[0]]
+    else:
+        indices = [round(i * (len(candidates) - 1) / (sample_count - 1)) for i in range(sample_count)]
+        images = [candidates[i] for i in indices]
+    print(f"[RKNN-Calib] 代表性等距抽样={len(images)}/{len(candidates)}，offset={offset}")
 
+    return images
+
+
+def _save_calib_dataset(data_yaml: str, imgsz: int, count: int, offset: int = 0) -> str:
+    """! 收集校准图片并落盘为 RGB 副本，返回 dataset.txt 路径。
+
+    @param data_yaml 数据集 YAML 路径。
+    @param imgsz 校准输入尺寸（未使用，保留供调用方一致性）。
+    @param count 校准图片数量。
+    @param offset 起始偏移量，跳过前 N 张图片，用于避免与评测集重叠。
+    @return dataset.txt 路径。
+    @note YOLO26 模型权重训练时使用 RGB（Ultralytics 默认 BGR2RGB），所以
+    RKNN INT8 校准必须喂 RGB；否则 quantize scale 与权重通道错位。详见
+    `tools.eval.backend_utils.make_rgb_calib_dataset` 注释。
+    """
+    del imgsz
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from tools.eval.backend_utils import make_rgb_calib_dataset
+
+    images = collect_calib_images(data_yaml, count, offset)
     return make_rgb_calib_dataset(images, prefix="rknn_calib_")
 
 
@@ -239,33 +292,34 @@ def build_fp16_rknn(
     """使用 RKNN-toolkit2 将指定 ONNX 构建并导出为 FP16 RKNN。"""
     from rknn.api import RKNN
 
+    onnx_path = str(Path(onnx_path).resolve())
+    output_path = str(Path(output_path).resolve())
     rknn = RKNN(verbose=True)
-    rknn.config(
-        target_platform=target,
-        mean_values=[[0, 0, 0]],
-        std_values=[[255, 255, 255]],
-        optimization_level=optimization_level,
-        quantized_dtype="asymmetric_quantized-8",
-    )
-
-    ret = rknn.load_onnx(model=onnx_path)
-    if ret != 0:
-        raise RuntimeError(f"load_onnx 失败: {ret}")
-
-    ret = call_rknn_build(
-        rknn,
-        do_quantization=False,
-        compress_weight=compress_weight,
-        model_pruning=model_pruning,
-    )
-    if ret != 0:
-        raise RuntimeError(f"build 失败: {ret}")
-
-    ret = rknn.export_rknn(output_path)
-    if ret != 0:
-        raise RuntimeError(f"export_rknn 失败: {ret}")
-
-    rknn.release()
+    try:
+        with isolated_rknn_workspace():
+            rknn.config(
+                target_platform=target,
+                mean_values=[[0, 0, 0]],
+                std_values=[[255, 255, 255]],
+                optimization_level=optimization_level,
+                quantized_dtype="asymmetric_quantized-8",
+            )
+            ret = rknn.load_onnx(model=onnx_path)
+            if ret != 0:
+                raise RuntimeError(f"load_onnx 失败: {ret}")
+            ret = call_rknn_build(
+                rknn,
+                do_quantization=False,
+                compress_weight=compress_weight,
+                model_pruning=model_pruning,
+            )
+            if ret != 0:
+                raise RuntimeError(f"build 失败: {ret}")
+            ret = rknn.export_rknn(str(Path(output_path).resolve()))
+            if ret != 0:
+                raise RuntimeError(f"export_rknn 失败: {ret}")
+    finally:
+        rknn.release()
 
 
 def main() -> int:
@@ -279,6 +333,12 @@ def main() -> int:
         )
 
     onnx_path = ensure_onnx(args.weights, args.imgsz, args.e2e_mode)
+    import onnx
+
+    model = onnx.load(onnx_path)
+    output_ranks = [len(output.type.tensor_type.shape.dim) for output in model.graph.output]
+    if 4 in output_ranks:
+        raise SystemExit("通用 FP16 入口不支持分割模型；请使用 export_seg_rknn_i8.py，确保部署产物满足统一五输出契约。")
     prepared_onnx = prepare_onnx(onnx_path, fix_paddle=not args.no_fix)
 
     if args.output:

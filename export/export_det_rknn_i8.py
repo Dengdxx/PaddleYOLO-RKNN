@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="一步导出 det RKNN（内部仅走 pre_dist / pre_dfl）")
     p.add_argument("--weights", required=True, help="输入权重路径（.pdparams / onnx）")
+    p.add_argument("--route", choices=["predist", "predfl"], help="要求的部署 route；不匹配时拒绝编译")
     p.add_argument("--data", default=None, help="校准数据集 YAML（仅 int8 模式需要）")
     p.add_argument("--output", default=None, help="输出 .rknn 路径")
     p.add_argument("--mode", default="int8", choices=["fp16", "int8"], help="导出模式")
@@ -174,6 +175,10 @@ def main() -> int:
         args.imgsz,
         auto_export_onnx,
     )
+    public_route = "predfl" if route == "pre_dfl" else "predist"
+    if args.route and args.route != public_route:
+        cleanup_temp_paths(cleanup_paths)
+        raise ValueError(f"请求 route={args.route}，但模型实际为 {public_route}")
 
     try:
         algorithm = default_algorithm(route, args.algorithm)
@@ -187,19 +192,24 @@ def main() -> int:
         print(f"[{tag}] onnx={fixed_onnx}")
         print(f"[{tag}] output={output_path}")
 
-        build_rknn(
-            fixed_onnx,
-            output_path,
-            args.mode,
-            args.data,
-            args.imgsz,
-            args.target,
-            args.calib_images,
-            algorithm,
-            args.optimization_level,
-            auto_hybrid=args.auto_hybrid,
-            calib_offset=args.calib_offset,
-        )
+        from export.export_rknn import isolated_rknn_workspace
+
+        fixed_onnx = str(Path(fixed_onnx).resolve())
+        output_path = str(Path(output_path).resolve())
+        with isolated_rknn_workspace():
+            build_rknn(
+                fixed_onnx,
+                output_path,
+                args.mode,
+                args.data,
+                args.imgsz,
+                args.target,
+                args.calib_images,
+                algorithm,
+                args.optimization_level,
+                auto_hybrid=args.auto_hybrid,
+                calib_offset=args.calib_offset,
+            )
         print(f"[{tag}] 完成: {output_path}")
         return 0
     finally:

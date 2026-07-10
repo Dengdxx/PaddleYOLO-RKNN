@@ -15,8 +15,8 @@
  * 4. 应用置信度阈值；
  * 5. 使用与导出/评测一致的半精度语义解码 box。
  *
- * 该文件不依赖 RKNN Runtime，主要用于比较 `scalar`、`scalar_logit` 和
- * `neon_logit` 三种实现是否与 Python 参考一致，并粗略测量筛选和解码阶段耗时。
+ * 该文件不依赖 RKNN Runtime，用于验证 AArch64 NEON 优化实现
+ * 是否与 Python 参考一致，并粗略测量筛选和解码阶段耗时。
  */
 #include <algorithm>
 #include <cmath>
@@ -35,9 +35,11 @@
 
 namespace fs = std::filesystem;
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
+#if !defined(__aarch64__) || !defined(__ARM_NEON)
+#error "predist_tail_bench requires AArch64 NEON"
 #endif
+
+#include <arm_neon.h>
 
 namespace {
 
@@ -82,11 +84,7 @@ struct AnchorGrid {
   std::vector<float> stride_vals;  // [n]
 };
 
-#if defined(__aarch64__) || defined(__arm__)
 using half_float_t = __fp16;
-#else
-using half_float_t = _Float16;
-#endif
 
 /**
  * @brief 读取完整文本文件。
@@ -349,80 +347,6 @@ float decode_coord_f16(float anchor, float delta, float stride, bool add) {
 }
 
 /**
- * @brief 标量版 `predist exact tail` 选择逻辑。
- *
- * @details
- * 该实现先对所有类别 logit 做 sigmoid，再按 anchor 聚合最大 score。
- * 逻辑最直观，主要作为正确性基线：
- *
- * - `anchor_max`: 每个 anchor 的最大类别概率；
- * - `ori_index`: top-k anchor 的原始下标；
- * - `flat_scores`: top-k anchor 内所有类别的概率展平排序。
- *
- * @param meta fixture 元信息。
- * @param logits 类别 logits，布局为 `[nc, n]`。
- * @return 通过阈值后的 anchor 下标、类别和概率；不含 box。
- */
-TailResult select_exact_scalar(const Meta& meta,
-                               const std::vector<float>& logits) {
-  std::vector<float> scores(static_cast<std::size_t>(meta.nc) * meta.n, 0.0f);
-  std::vector<std::pair<float, int>> anchor_max;
-  anchor_max.reserve(meta.n);
-
-  for (int anchor = 0; anchor < meta.n; ++anchor) {
-    float max_score = -std::numeric_limits<float>::infinity();
-    for (int cls = 0; cls < meta.nc; ++cls) {
-      const float score = sigmoid(logits[static_cast<std::size_t>(cls) * meta.n + anchor]);
-      scores[static_cast<std::size_t>(cls) * meta.n + anchor] = score;
-      if (score > max_score) {
-        max_score = score;
-      }
-    }
-    anchor_max.emplace_back(max_score, anchor);
-  }
-
-  std::stable_sort(anchor_max.begin(), anchor_max.end(),
-                   [](const auto& a, const auto& b) { return a.first > b.first; });
-
-  const int k = std::min(meta.max_det, meta.n);
-  std::vector<int> ori_index;
-  ori_index.reserve(k);
-  for (int i = 0; i < k; ++i) {
-    ori_index.push_back(anchor_max[static_cast<std::size_t>(i)].second);
-  }
-
-  std::vector<std::pair<float, int>> flat_scores;
-  flat_scores.reserve(static_cast<std::size_t>(k) * meta.nc);
-  for (int gather_pos = 0; gather_pos < k; ++gather_pos) {
-    const int anchor = ori_index[static_cast<std::size_t>(gather_pos)];
-    for (int cls = 0; cls < meta.nc; ++cls) {
-      const float score = scores[static_cast<std::size_t>(cls) * meta.n + anchor];
-      flat_scores.emplace_back(score, gather_pos * meta.nc + cls);
-    }
-  }
-  std::stable_sort(flat_scores.begin(), flat_scores.end(),
-                   [](const auto& a, const auto& b) { return a.first > b.first; });
-
-  TailResult result;
-  for (int i = 0; i < k; ++i) {
-    const float score = flat_scores[static_cast<std::size_t>(i)].first;
-    if (!(score > meta.conf_thresh)) {
-      continue;
-    }
-    const int flat_index = flat_scores[static_cast<std::size_t>(i)].second;
-    const int anchor_idx = flat_index / meta.nc;
-    const int class_idx = flat_index % meta.nc;
-    const int final_idx = ori_index[static_cast<std::size_t>(anchor_idx)];
-
-    result.final_idx.push_back(final_idx);
-    result.class_ids.push_back(class_idx);
-    result.scores.push_back(score);
-  }
-
-  return result;
-}
-
-/**
  * @brief 解码筛选后的 l/t/r/b box。
  * @param meta fixture 元信息。
  * @param grid anchor 网格。
@@ -430,10 +354,10 @@ TailResult select_exact_scalar(const Meta& meta,
  * @param final_idx 需要解码的 anchor 原始下标。
  * @return 展平 `[k, 4]` 的 xyxy 坐标。
  */
-std::vector<float> decode_boxes_scalar(const Meta& meta,
-                                       const AnchorGrid& grid,
-                                       const std::vector<float>& raw_ltrb,
-                                       const std::vector<int>& final_idx) {
+std::vector<float> decode_boxes(const Meta& meta,
+                                const AnchorGrid& grid,
+                                const std::vector<float>& raw_ltrb,
+                                const std::vector<int>& final_idx) {
   std::vector<float> boxes;
   boxes.reserve(final_idx.size() * 4);
 
@@ -455,116 +379,18 @@ std::vector<float> decode_boxes_scalar(const Meta& meta,
 }
 
 /**
- * @brief 标量基线完整路径：筛选 + box 解码。
- */
-TailResult run_exact_scalar(const Meta& meta,
-                            const AnchorGrid& grid,
-                            const std::vector<float>& raw_ltrb,
-                            const std::vector<float>& logits) {
-  TailResult result = select_exact_scalar(meta, logits);
-  result.boxes = decode_boxes_scalar(meta, grid, raw_ltrb, result.final_idx);
-  return result;
-}
-
-/**
- * @brief logit 阈值版标量选择逻辑。
- *
- * @details
- * sigmoid 单调递增，因此 top-k 排序和阈值过滤都可直接在 logit 域完成：
- * `score > conf` 等价于 `logit > log(conf / (1-conf))`。该实现避免对
- * 全量 `[nc, n]` 张量做 sigmoid，只对最终保留结果计算 score。
- *
- * @param meta fixture 元信息。
- * @param logits 类别 logits，布局为 `[nc, n]`。
- * @return 通过阈值后的 anchor 下标、类别和概率；不含 box。
- */
-TailResult select_exact_scalar_logit(const Meta& meta,
-                                     const std::vector<float>& logits) {
-  TailResult result;
-  std::vector<std::pair<float, int>> anchor_max;
-  anchor_max.reserve(meta.n);
-
-  for (int anchor = 0; anchor < meta.n; ++anchor) {
-    float max_logit = -std::numeric_limits<float>::infinity();
-    for (int cls = 0; cls < meta.nc; ++cls) {
-      const float logit = logits[static_cast<std::size_t>(cls) * meta.n + anchor];
-      if (logit > max_logit) {
-        max_logit = logit;
-      }
-    }
-    anchor_max.emplace_back(max_logit, anchor);
-  }
-
-  std::stable_sort(anchor_max.begin(), anchor_max.end(),
-                   [](const auto& a, const auto& b) { return a.first > b.first; });
-
-  const int k = std::min(meta.max_det, meta.n);
-  std::vector<int> ori_index;
-  ori_index.reserve(k);
-  for (int i = 0; i < k; ++i) {
-    ori_index.push_back(anchor_max[static_cast<std::size_t>(i)].second);
-  }
-
-  std::vector<std::pair<float, int>> flat_logits;
-  flat_logits.reserve(static_cast<std::size_t>(k) * meta.nc);
-  for (int gather_pos = 0; gather_pos < k; ++gather_pos) {
-    const int anchor = ori_index[static_cast<std::size_t>(gather_pos)];
-    for (int cls = 0; cls < meta.nc; ++cls) {
-      const float logit = logits[static_cast<std::size_t>(cls) * meta.n + anchor];
-      flat_logits.emplace_back(logit, gather_pos * meta.nc + cls);
-    }
-  }
-  std::stable_sort(flat_logits.begin(), flat_logits.end(),
-                   [](const auto& a, const auto& b) { return a.first > b.first; });
-
-  const float conf = std::clamp(meta.conf_thresh, 1e-9f, 1.0f - 1e-9f);
-  const float logit_thresh = std::log(conf / (1.0f - conf));
-
-  for (int i = 0; i < k; ++i) {
-    const float logit = flat_logits[static_cast<std::size_t>(i)].first;
-    if (!(logit > logit_thresh)) {
-      continue;
-    }
-    const int flat_index = flat_logits[static_cast<std::size_t>(i)].second;
-    const int anchor_idx = flat_index / meta.nc;
-    const int class_idx = flat_index % meta.nc;
-    const int final_idx = ori_index[static_cast<std::size_t>(anchor_idx)];
-
-    result.final_idx.push_back(final_idx);
-    result.class_ids.push_back(class_idx);
-    result.scores.push_back(sigmoid(logit));
-  }
-
-  return result;
-}
-
-/**
- * @brief logit 阈值版完整路径：筛选 + box 解码。
- */
-TailResult run_exact_scalar_logit(const Meta& meta,
-                                  const AnchorGrid& grid,
-                                  const std::vector<float>& raw_ltrb,
-                                  const std::vector<float>& logits) {
-  TailResult result = select_exact_scalar_logit(meta, logits);
-  result.boxes = decode_boxes_scalar(meta, grid, raw_ltrb, result.final_idx);
-  return result;
-}
-
-#if defined(__ARM_NEON)
-/**
  * @brief NEON 加速的 logit 阈值选择逻辑。
  *
  * @details
  * 该实现用 `vmaxq_f32` 加速“每个 anchor 跨类别取最大 logit”的阶段。
- * 后续 top-k 排序、类别展开排序和阈值过滤保持与 `scalar_logit` 相同，
- * 以便验证 NEON 优化只改变性能，不改变语义。
+ * 后续 top-k 排序、类别展开排序和阈值过滤保持导出语义。
  *
  * @param meta fixture 元信息。
  * @param logits 类别 logits，布局为 `[nc, n]`。
  * @return 通过阈值后的 anchor 下标、类别和概率；不含 box。
  */
-TailResult select_exact_neon_logit(const Meta& meta,
-                                   const std::vector<float>& logits) {
+TailResult select_exact_optimized(const Meta& meta,
+                                  const std::vector<float>& logits) {
   TailResult result;
   std::vector<float> max_logits(static_cast<std::size_t>(meta.n),
                                 -std::numeric_limits<float>::infinity());
@@ -635,15 +461,14 @@ TailResult select_exact_neon_logit(const Meta& meta,
 /**
  * @brief NEON logit 阈值版完整路径：筛选 + box 解码。
  */
-TailResult run_exact_neon_logit(const Meta& meta,
-                                const AnchorGrid& grid,
-                                const std::vector<float>& raw_ltrb,
-                                const std::vector<float>& logits) {
-  TailResult result = select_exact_neon_logit(meta, logits);
-  result.boxes = decode_boxes_scalar(meta, grid, raw_ltrb, result.final_idx);
+TailResult run_exact_optimized(const Meta& meta,
+                               const AnchorGrid& grid,
+                               const std::vector<float>& raw_ltrb,
+                               const std::vector<float>& logits) {
+  TailResult result = select_exact_optimized(meta, logits);
+  result.boxes = decode_boxes(meta, grid, raw_ltrb, result.final_idx);
   return result;
 }
-#endif
 
 /**
  * @brief 带容差的浮点比较。
@@ -697,47 +522,17 @@ void verify_exact_match(const TailResult& result, const Expected& expected) {
 }
 
 /**
- * @brief 按名称运行指定实现变体。
- * @param variant `scalar` / `scalar_logit` / `neon_logit`。
- * @param meta fixture 元信息。
- * @param grid anchor 网格。
- * @param raw_ltrb 距离预测，布局为 `[4, n]`。
- * @param logits 类别 logits，布局为 `[nc, n]`。
- * @return 指定实现的完整 tail 输出。
- * @throw std::runtime_error 变体名不受支持，或当前平台未编译 NEON 变体。
- */
-TailResult run_variant(const std::string& variant,
-                       const Meta& meta,
-                       const AnchorGrid& grid,
-                       const std::vector<float>& raw_ltrb,
-                       const std::vector<float>& logits) {
-  if (variant == "scalar") {
-    return run_exact_scalar(meta, grid, raw_ltrb, logits);
-  }
-  if (variant == "scalar_logit") {
-    return run_exact_scalar_logit(meta, grid, raw_ltrb, logits);
-  }
-#if defined(__ARM_NEON)
-  if (variant == "neon_logit") {
-    return run_exact_neon_logit(meta, grid, raw_ltrb, logits);
-  }
-#endif
-  throw std::runtime_error("unsupported variant: " + variant);
-}
-
-/**
  * @brief 校验模式入口。
  *
  * @details
- * 读取 fixture 后运行指定变体，并与 `expected.json` 中的 Python 参考结果比较。
+ * 读取 fixture 后运行 NEON 优化实现，并与 `expected.json` 中的 Python 参考结果比较。
  * 成功时输出 `fixture_loaded`；若 fixture 含完整期望结果，还会输出
  * `exact_match`。
  *
  * @param fixture_dir fixture 目录。
- * @param variant 实现变体。
  * @return 进程退出码，成功为 0。
  */
-int run_verify(const fs::path& fixture_dir, const std::string& variant) {
+int run_verify(const fs::path& fixture_dir) {
   require_file(fixture_dir / "meta.json");
   require_file(fixture_dir / "expected.json");
   require_file(fixture_dir / "ltrb.bin");
@@ -752,7 +547,7 @@ int run_verify(const fs::path& fixture_dir, const std::string& variant) {
   const auto raw_ltrb = read_binary_f32(fixture_dir / "ltrb.bin", static_cast<std::size_t>(4) * meta.n);
   const auto logits = read_binary_f32(fixture_dir / "scores.bin", static_cast<std::size_t>(meta.nc) * meta.n);
   const AnchorGrid grid = make_anchor_grid(meta);
-  const TailResult result = run_variant(variant, meta, grid, raw_ltrb, logits);
+  const TailResult result = run_exact_optimized(meta, grid, raw_ltrb, logits);
 
   std::cout << "fixture_loaded" << std::endl;
   verify_exact_match(result, expected);
@@ -766,15 +561,14 @@ int run_verify(const fs::path& fixture_dir, const std::string& variant) {
  * @brief 微基准模式入口。
  *
  * @details
- * 重复运行指定变体，并分别统计筛选阶段和 box 解码阶段的平均耗时。
+ * 重复运行 NEON 优化实现，并分别统计筛选阶段和 box 解码阶段的平均耗时。
  * 该模式使用固定 fixture，不包含 RKNN 推理、输入预处理或 NMS。
  *
  * @param fixture_dir fixture 目录。
  * @param iters 迭代次数。
- * @param variant 实现变体。
  * @return 进程退出码，成功为 0。
  */
-int run_bench(const fs::path& fixture_dir, int iters, const std::string& variant) {
+int run_bench(const fs::path& fixture_dir, int iters) {
   if (iters <= 0) {
     throw std::runtime_error("iters must be > 0");
   }
@@ -790,19 +584,9 @@ int run_bench(const fs::path& fixture_dir, int iters, const std::string& variant
 
   for (int i = 0; i < iters; ++i) {
     const auto t0 = std::chrono::steady_clock::now();
-    if (variant == "scalar") {
-      last_result = select_exact_scalar(meta, logits);
-    } else if (variant == "scalar_logit") {
-      last_result = select_exact_scalar_logit(meta, logits);
-#if defined(__ARM_NEON)
-    } else if (variant == "neon_logit") {
-      last_result = select_exact_neon_logit(meta, logits);
-#endif
-    } else {
-      throw std::runtime_error("unsupported variant: " + variant);
-    }
+    last_result = select_exact_optimized(meta, logits);
     const auto t1 = std::chrono::steady_clock::now();
-    last_result.boxes = decode_boxes_scalar(meta, grid, raw_ltrb, last_result.final_idx);
+    last_result.boxes = decode_boxes(meta, grid, raw_ltrb, last_result.final_idx);
     const auto t2 = std::chrono::steady_clock::now();
 
     select_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -814,8 +598,7 @@ int run_bench(const fs::path& fixture_dir, int iters, const std::string& variant
   const double fps = avg_total_ms > 0.0 ? 1000.0 / avg_total_ms : 0.0;
 
   std::cout << std::fixed << std::setprecision(4)
-            << "variant=" << variant
-            << " stage_select_ms=" << (select_ms / static_cast<double>(iters))
+            << "stage_select_ms=" << (select_ms / static_cast<double>(iters))
             << " stage_decode_ms=" << (decode_ms / static_cast<double>(iters))
             << " total_ms=" << avg_total_ms
             << " fps=" << fps
@@ -832,10 +615,8 @@ int run_bench(const fs::path& fixture_dir, int iters, const std::string& variant
  * @details
  * 支持两种模式：
  *
- * - `--verify <fixture_dir> [--variant <name>]`：与 Python 参考结果比对；
- * - `--bench <fixture_dir> --iters <n> --variant <name>`：输出平均阶段耗时。
- *
- * 变体名包括 `scalar`、`scalar_logit`，在 ARM NEON 平台还包括 `neon_logit`。
+ * - `--verify <fixture_dir>`：与 Python 参考结果比对；
+ * - `--bench <fixture_dir> --iters <n>`：输出平均阶段耗时。
  *
  * @param argc 参数数量。
  * @param argv 参数数组。
@@ -844,19 +625,14 @@ int run_bench(const fs::path& fixture_dir, int iters, const std::string& variant
 int main(int argc, char** argv) {
   try {
     if (argc == 3 && std::string(argv[1]) == "--verify") {
-      return run_verify(argv[2], "scalar");
+      return run_verify(argv[2]);
     }
-    if (argc == 5 && std::string(argv[1]) == "--verify" &&
-        std::string(argv[3]) == "--variant") {
-      return run_verify(argv[2], argv[4]);
-    }
-    if (argc == 7 && std::string(argv[1]) == "--bench" &&
-        std::string(argv[3]) == "--iters" &&
-        std::string(argv[5]) == "--variant") {
-      return run_bench(argv[2], std::stoi(argv[4]), argv[6]);
+    if (argc == 5 && std::string(argv[1]) == "--bench" &&
+        std::string(argv[3]) == "--iters") {
+      return run_bench(argv[2], std::stoi(argv[4]));
     }
     std::cerr << "usage: " << argv[0]
-              << " --verify <fixture_dir> | --bench <fixture_dir> --iters <n> --variant <name>"
+              << " --verify <fixture_dir> | --bench <fixture_dir> --iters <n>"
               << std::endl;
       return 2;
   } catch (const std::exception& e) {

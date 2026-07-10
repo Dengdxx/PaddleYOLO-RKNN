@@ -32,8 +32,8 @@ BASELINES_ROOT = ARTIFACTS / "coco_baselines"
 DATA_YAML = ROOT / "ddyolo26" / "cfg" / "datasets" / "coco-val2017-only.yaml"
 TARGET_MODELS = ["yolo26n", "yolov8n", "yolo26n-seg", "yolov8n-seg"]
 
-VAL_ZIP = "http://images.cocodataset.org/zips/val2017.zip"
-ANNO_ZIP = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+VAL_ZIP = "https://images.cocodataset.org/zips/val2017.zip"
+ANNO_ZIP = "https://images.cocodataset.org/annotations/annotations_trainval2017.zip"
 LABELS_SEG_ZIP = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco2017labels-segments.zip"
 
 
@@ -45,14 +45,40 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def verify_zip(path: Path) -> None:
+    """完整读取 ZIP 中央目录和成员 CRC，拒绝截断或损坏缓存。"""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            bad_member = archive.testzip()
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(f"ZIP 文件损坏: {path}") from exc
+    if bad_member is not None:
+        raise RuntimeError(f"ZIP 成员 CRC 校验失败: {path}: {bad_member}")
+
+
 def download(url: str, dest: Path) -> None:
+    """通过 HTTPS 下载到临时文件，校验 ZIP 后原子替换缓存。"""
+    if not url.startswith("https://"):
+        raise ValueError(f"只允许 HTTPS 下载: {url}")
     if dest.exists() and dest.stat().st_size > 0:
-        log(f"复用已下载文件: {dest}")
-        return
+        try:
+            verify_zip(dest)
+            log(f"复用已校验下载文件: {dest}")
+            return
+        except RuntimeError:
+            log(f"删除损坏缓存并重新下载: {dest}")
+            dest.unlink()
     ensure_dir(dest.parent)
     log(f"下载 {url} -> {dest}")
-    with urllib.request.urlopen(url) as resp, open(dest, "wb") as f:
-        shutil.copyfileobj(resp, f)
+    temporary = dest.with_suffix(dest.suffix + ".part")
+    temporary.unlink(missing_ok=True)
+    try:
+        with urllib.request.urlopen(url) as resp, open(temporary, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        verify_zip(temporary)
+        temporary.replace(dest)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def extract_member(zip_path: Path, member: str, dest: Path) -> None:
@@ -74,6 +100,8 @@ def extract_tree(zip_path: Path, prefix: str, dest_root: Path, *, strip_prefix: 
         for member in members:
             rel = member[len(strip_prefix) :] if strip_prefix else member
             out = dest_root / rel
+            if dest_root.resolve() not in out.resolve().parents:
+                raise RuntimeError(f"ZIP 成员路径越界: {member}")
             if out.exists():
                 continue
             ensure_dir(out.parent)
@@ -113,11 +141,9 @@ def prepare_dataset(download_enabled: bool) -> None:
     download(ANNO_ZIP, anno_zip)
     download(LABELS_SEG_ZIP, labels_zip)
 
-    # val images: zip 根即 val2017/
+    # val images: zip 根即 val2017/；逐成员安全解压，不使用 extractall。
     if not (COCO_ROOT / "images" / "val2017").exists():
-        with zipfile.ZipFile(val_zip) as zf:
-            zf.extractall(COCO_ROOT / "images")
-        log(f"已解压 val2017 -> {COCO_ROOT / 'images'}")
+        extract_tree(val_zip, "val2017/", COCO_ROOT / "images")
 
     # labels zip 内通常为 coco/labels/**
     if not (COCO_ROOT / "labels" / "val2017").exists():

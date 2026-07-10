@@ -93,7 +93,6 @@ class Detect(paddle.nn.Module):
     agnostic_nms = False
     export_raw_one2one = False
     export_use_one2many = False
-    export_rknn = False
     export_dual_raw = False  # 导出双输出 (boxes, scores) — 与 ultralytics pre_dist/pre_dfl 等价
     _feat_shape = None
     anchors = paddle.empty(0)
@@ -491,43 +490,8 @@ class Segment(Detect):
             return
         self.cv2 = self.cv3 = self.cv4 = None
 
-    def _forward_export_rknn(self, x: list[paddle.Tensor]) -> list[paddle.Tensor]:
-        """RKNN 专用导出支路（仿 rknn_model_zoo 官方 13 输出格式）。
-
-        完全绕过 DFL 解码、坐标转换、NMS 后处理，直接输出各尺度卷积特征，
-        令 RKNN Toolkit2 可对每个尺度独立量化，并通过 cls_sum 加速 CPU 端过滤。
-
-        使用 one2many 头（cv2/cv3/cv4），不依赖 one2one/end2end 属性。
-
-        输出顺序（共 13 个 Tensor，NCHW）：
-            对 i = 0, 1, 2（stride=8,16,32）：
-                box_i      [B, 4*reg_max, H_i, W_i]  — 原始 DFL 特征
-                cls_i      [B, nc, H_i, W_i]          — Sigmoid 激活后分类分数
-                cls_sum_i  [B, 1, H_i, W_i]           — clamp(cls_i.sum(1), 0, 1)，用于 CPU 快速滤格
-                mask_i     [B, nm, H_i, W_i]          — 原始 mask 系数（无激活）
-            proto          [B, nm, H/4, W/4]          — Prototype 特征
-
-        参数:
-            x: 各尺度骨干/颈部特征图列表，长度等于 self.nl。
-
-        返回:
-            长度为 13 的 Tensor 列表。
-        """
-        out = []
-        for i in range(self.nl):
-            box_i = self.cv2[i](x[i])  # [B, 4*reg_max, H, W]
-            cls_i = paddle.nn.functional.sigmoid(self.cv3[i](x[i]))  # [B, nc, H, W]
-            cls_sum_i = paddle.clip(cls_i.sum(axis=1, keepdim=True), min=0.0, max=1.0)
-            mask_i = self.cv4[i](x[i])  # [B, nm, H, W]
-            out.extend([box_i, cls_i, cls_sum_i, mask_i])
-        proto = self.proto(x[0])  # [B, nm, H/4, W/4]
-        out.append(proto)
-        return out
-
     def _forward_export(self, x: list[paddle.Tensor]) -> paddle.Tensor:
         """导出友好的前向传播，返回检测 + mask proto。"""
-        if self.export_rknn:
-            return self._forward_export_rknn(x)
         if not self.end2end or self.export_use_one2many:
             head_dict = self.one2many
         else:
@@ -535,7 +499,7 @@ class Segment(Detect):
         preds = self.forward_head(x, **head_dict)
         proto = self.proto(x[0])
         if self.export_dual_raw:
-            # 四输出原始张量（与 ultralytics seg_pre_dist 等价）
+            # 四输出仅作为导出瞬态张量，后续统一追加 score_sum 形成五输出。
             #   boxes        [B, 4*reg_max, A]
             #   scores       [B, nc, A]                (未 sigmoid)
             #   mask_coeff   [B, nm, A]
@@ -627,29 +591,8 @@ class Segment26(Segment):
         if hasattr(self.proto, "fuse"):
             self.proto.fuse()
 
-    def _forward_export_rknn(self, x: list[paddle.Tensor]) -> list[paddle.Tensor]:
-        """RKNN 专用导出支路（Proto26 版）。
-
-        与 Segment._forward_export_rknn 相同逻辑，但 proto 由 Proto26(x) 生成。
-        Proto26 接收多尺度特征列表，proto 本身仍为 [B, nm, H/4, W/4]。
-
-        输出 13 个 Tensor（同 Segment RKNN 格式）。
-        """
-        out = []
-        for i in range(self.nl):
-            box_i = self.cv2[i](x[i])
-            cls_i = paddle.nn.functional.sigmoid(self.cv3[i](x[i]))
-            cls_sum_i = paddle.clip(cls_i.sum(axis=1, keepdim=True), min=0.0, max=1.0)
-            mask_i = self.cv4[i](x[i])
-            out.extend([box_i, cls_i, cls_sum_i, mask_i])
-        proto = self.proto(x)  # Proto26 接收 list[Tensor]
-        out.append(proto)
-        return out
-
     def _forward_export(self, x: list[paddle.Tensor]) -> paddle.Tensor:
         """导出友好的前向传播，Proto26 接收多尺度特征。"""
-        if self.export_rknn:
-            return self._forward_export_rknn(x)
         # 选择检测头：非 end2end 模型只有 one2many 头
         if not self.end2end or self.export_use_one2many:
             head_dict = self.one2many

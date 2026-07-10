@@ -1,5 +1,9 @@
 # COCO val2017 baseline
 
+数据准备脚本只使用 HTTPS，下载到 `.part` 后执行 ZIP 完整性与成员 CRC
+检查，再原子写入缓存。模型导出缓存通过源权重、数据 YAML、route、尺寸、
+校准规模和 Python 环境指纹复用；缺少或不匹配指纹时会重新生成。
+
 本页给出 YOLO26 / YOLOv8 在 **COCO val2017 子集**（前 1000 张，按文件名 sorted）下的 baseline：
 
 - 模型：`yolo26n` / `yolo26n-seg` / `yolov8n` / `yolov8n-seg`
@@ -8,7 +12,7 @@
 - 精度：`fp32` / `int8`
 - 后端：`onnx`（host GPU，ONNX Runtime CUDAExecutionProvider）/ `rknn`（板端，OrangePi 5 RK3588S，NPU）
 
-精度指标由 `python -m tools.eval` 产生，与 Ultralytics `model.val()` 的度量设置一致（`conf=0.001`、`iou=0.7`、letterbox 预处理、自动检测输出格式 + 解码 + NMS）。RKNN 速度指标来自 `bench/bench_rknn_perf.c`：`RKNN_QUERY_PERF_RUN` 给出纯 NPU 时间，外层计时给出 `rknn_inputs_set + rknn_run + rknn_outputs_get + CPU/NEON 后处理` 的端到端时间。RKNN 速度测试使用 RKNN runtime / toolkit `2.3.2`，CPU/NPU/DDR 锁到 max 频。
+精度指标由 `python -m tools.eval` 产生，与 Ultralytics `model.val()` 的度量设置一致（`conf=0.001`、`iou=0.7`、letterbox 预处理、自动检测输出格式 + 解码 + NMS）。RKNN 速度指标来自 `bench/bench_rknn_perf.cpp`：`RKNN_QUERY_PERF_RUN` 给出纯 NPU 时间，外层计时给出 `rknn_inputs_set + rknn_run + rknn_outputs_get + ROI/NEON 分割后处理` 的端到端时间。RKNN 速度测试使用 RKNN runtime / toolkit `2.3.2`，CPU/NPU/DDR 锁到 max 频，并为 A/B 传入同一张真实 RGB 帧。
 
 ## 评测命令
 
@@ -35,6 +39,7 @@ ssh orangepi@<board> "cd <repo>/PaddleYOLO-RKNN && python3 -m tools.eval \
 ssh orangepi@<board> "cd <repo>/PaddleYOLO-RKNN && python scripts/board_bench_all.py \
   --bench ./bench/bench_rknn_perf \
   --models-root artifacts/coco_baselines/<model> \
+  --input frame_640.rgb \
   --summary-out artifacts/coco_baselines/<model>/_eval/<model>_board_bench_summary.json \
   --bench-status official \
   --frequency-profile cpu_npu_ddr_max"

@@ -14,15 +14,19 @@
 分割导出包括：
 - `seg_pre_dist`：与检测 `pre_dist` 对称
 - `seg_pre_dfl`：与检测 `pre_dfl` 对称，适用于 YOLOv8-Seg DFL head
-- 5 个输出张量（转置 DFL + score-sum 快速过滤）
+- 两条路线都固定 5 个输出张量，并提供 score-sum 快速过滤
 - CPU 端完成 `dist2bbox + coeff 聚合 + mask 重建`
 
 | 方案 | 代号 | 输出数 | 后处理复杂度 | 说明 |
 |------|------|--------|-------------|------|
-| `seg_pre_dist` | `predist` | 4 | 简单 | `raw ltrb + cls logits + mask_coeff + proto` |
+| `seg_pre_dist` | `predist` | 5 | 简单 | `raw ltrb + cls logits + mask_coeff + proto + score_sum` |
 | `seg_pre_dfl` | `seg_predfl` | 5 | 中等 | `raw DFL transposed + cls logits + mask_coeff + proto + score_sum` |
 
 ## 导出
+
+分割 RKNN 只有本页专用入口受支持。公共 `YOLO.export(format="rknn")`
+不直接编译分割模型，`export_one2many_onnx.py` 也只生成 ONNX 中间产物；
+最终 RKNN 必须先规范化为统一五输出。
 
 ```bash
 cd PaddleYOLO-RKNN
@@ -47,6 +51,7 @@ conda run --no-capture-output -n rknn python3 export/export_seg_rknn_i8.py \
 | 参数 | 说明 |
 |------|------|
 | `--weights` | route FP32 `.onnx`；普通 `.pt` 不支持 |
+| `--route` | 要求的 `seg_predist / seg_predfl`；与模型实际 route 不一致时立即失败 |
 | `--data` | 校准 YAML |
 | `--output` | 输出 `.rknn` 路径 |
 | `--target` | `rk3588` / `rk3588s` / `rk3576` / `rk3562` |
@@ -55,7 +60,9 @@ conda run --no-capture-output -n rknn python3 export/export_seg_rknn_i8.py \
 | `--algorithm` | `normal / mmse / kl_divergence` |
 | `--optimization-level` | RKNN 编译优化级别 |
 
-> 如果输入已经是 `seg_pre_dist` 四输出或 `seg_pre_dfl` 五输出 ONNX，脚本会跳过图手术直接编译。
+> 五输出 ONNX 会直接编译；导出过程产生的四输出 ONNX 会先自动规范化为五输出。
+> ORT QDQ INT8 ONNX 不可作为 RKNN 输入；RKNN Toolkit 只消费量化前的
+> route FP32 ONNX。Toolkit 中间文件在隔离临时目录生成，不会污染仓库。
 
 ## 示例产物
 
@@ -66,16 +73,17 @@ conda run --no-capture-output -n rknn python3 export/export_seg_rknn_i8.py \
 
 ## 输出契约
 
-`seg_pre_dist` 期望 4 个输出：
+`seg_pre_dist` 固定 5 个输出：
 
 ```text
 raw_ltrb   [1, 4,  N]
 cls_logits [1, nc, N]
 mask_coeff [1, nm, N]
 proto      [1, nm, PH, PW]
+score_sum  [1, 1,  N]
 ```
 
-`seg_pre_dfl` 期望 5 个输出：
+`seg_pre_dfl` 固定 5 个输出：
 
 ```text
 raw_dfl_transposed [1, N,         4*reg_max]
@@ -97,7 +105,7 @@ score_sum          [1, 1,         N]
 7. resize + threshold → binary mask
 ```
 
-- `seg_pre_dist / seg_pre_dfl` 不能依赖 `auto` 检测，需显式指定 `output_format`
+- 评估工具会按严格五输出形状自动识别 `seg_pre_dist / seg_pre_dfl`
 - 外部消费端按本页的输出契约对接
 
 ## 相关文档

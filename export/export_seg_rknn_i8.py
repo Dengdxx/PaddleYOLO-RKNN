@@ -7,7 +7,7 @@
 @details
 用户可以直接传入 Paddle 权重或 ONNX，脚本内部会自动执行：
 1. 导出普通 seg ONNX；
-2. 识别并裁剪到 `seg_pre_dist` 四输出或 `seg_pre_dfl` 五输出主线；
+2. 识别并裁剪到统一五输出的 `seg_pre_dist` 或 `seg_pre_dfl` 主线；
 3. 生成 RKNN INT8 模型（RGB 校准）。
 
 两条主线分别对应：
@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="一步导出 seg RKNN INT8（seg_pre_dist / seg_pre_dfl）")
     p.add_argument("--weights", required=True, help="输入权重路径（.pdparams / onnx）")
+    p.add_argument("--route", choices=["seg_predist", "seg_predfl"], help="要求的部署 route；不匹配时拒绝编译")
     p.add_argument("--data", required=True, help="校准数据集 YAML")
     p.add_argument("--output", default=None, help="输出 .rknn 路径")
     p.add_argument("--target", default="rk3588", choices=["rk3588", "rk3588s", "rk3576", "rk3562"])
@@ -169,7 +170,7 @@ def main() -> int:
     args = parse_args()
 
     from export.seg_onnx_routes import prepare_seg_onnx_i8_input
-    from export.export_rknn import prepare_onnx
+    from export.export_rknn import isolated_rknn_workspace, prepare_onnx
     from quant.quantize import auto_export_onnx
 
     route, prepared_onnx_path, cleanup_paths = prepare_seg_onnx_i8_input(
@@ -177,6 +178,10 @@ def main() -> int:
         args.imgsz,
         auto_export_onnx,
     )
+    public_route = "seg_predfl" if route == "seg_pre_dfl" else "seg_predist"
+    if args.route and args.route != public_route:
+        _cleanup_paths(cleanup_paths)
+        raise ValueError(f"请求 route={args.route}，但模型实际为 {public_route}")
 
     try:
         algorithm = default_algorithm(route, args.algorithm)
@@ -188,17 +193,20 @@ def main() -> int:
         print(f"[SEG-RKNN-I8] onnx={fixed_onnx}")
         print(f"[SEG-RKNN-I8] output={output_path}")
 
-        build_rknn_int8(
-            fixed_onnx,
-            output_path,
-            args.data,
-            args.imgsz,
-            args.target,
-            args.calib_images,
-            algorithm,
-            args.optimization_level,
-            calib_offset=args.calib_offset,
-        )
+        fixed_onnx = str(Path(fixed_onnx).resolve())
+        output_path = str(Path(output_path).resolve())
+        with isolated_rknn_workspace():
+            build_rknn_int8(
+                fixed_onnx,
+                output_path,
+                args.data,
+                args.imgsz,
+                args.target,
+                args.calib_images,
+                algorithm,
+                args.optimization_level,
+                calib_offset=args.calib_offset,
+            )
         size_mb = Path(output_path).stat().st_size / 1024 / 1024
         print(f"[SEG-RKNN-I8] 完成: {output_path} ({size_mb:.1f} MB)")
         return 0

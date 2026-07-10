@@ -40,8 +40,9 @@ model.export(format="onnx", imgsz=640, simplify=True)
 
 ## NEON 后处理
 
-`bench/predist_tail_bench.cpp` 提供 `scalar` / `scalar_logit` / `neon_logit` 变体，
+`bench/predist_tail_bench.cpp` 仅提供 AArch64 NEON 优化实现，
 用于验证 YOLO26 `predist` 后处理尾部的数值一致性和耗时。
+该工具面向 RK3588 板端，不提供标量算法切换。
 
 端到端评估仍以 `tools/eval/` 的 Python / NumPy 参考实现为准。
 

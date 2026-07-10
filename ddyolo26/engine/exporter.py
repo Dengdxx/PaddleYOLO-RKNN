@@ -253,6 +253,11 @@ class Exporter:
         if sum(flags) != 1:
             raise ValueError(f"导出格式 format='{fmt}' 无效。有效格式为 {fmts}")
         onnx, engine, rknn = flags
+        if rknn and getattr(model, "task", "detect") == "segment":
+            raise ValueError(
+                "公共 YOLO.export(format='rknn') 不直接编译分割模型；"
+                "请使用 export/export_seg_rknn_i8.py，先规范化为统一五输出再编译 RKNN。"
+            )
         dla = None
         if engine and self.args.device is None:
             LOGGER.warning("TensorRT 需要在 GPU 上导出，已自动设置 device=0")
@@ -321,8 +326,8 @@ class Exporter:
                 m.export = True
                 m.format = self.args.format
                 if getattr(self.args, "dual_raw", False) and isinstance(m, Detect):
-                    # 双输出模式：返回 head_dict 的 boxes/scores（以及 mask_coeff/proto）原始张量。
-                    # 与 ultralytics pre_dist / pre_dfl / seg_pre_dist 契约等价。
+                    # 原始输出模式：返回 head_dict 的 boxes/scores（分割头另含 mask_coeff/proto）。
+                    # 分割四输出仅供后续导出步骤规范化为五输出。
                     # end2end 模型自动走 one2one head，非 end2end 走 one2many（cv2/cv3）。
                     m.export_dual_raw = True
                 if getattr(self.args, "export_raw_one2one", False) and isinstance(m, Detect):

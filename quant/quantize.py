@@ -105,9 +105,8 @@ def auto_export_onnx(weights_path: str, imgsz: int) -> str:
         from ddyolo26 import YOLO  # noqa: PLC0415
 
         yolo = YOLO(weights_path)
-        # dual_raw=True：直接输出 boxes/scores（detect）或 boxes/scores/mask_coeff/proto（segment）
-        # 与 ultralytics pre_dist / pre_dfl / seg_pre_dist 契约等价，可被 prepare_*_onnx_i8_input
-        # 通过 detect_prepared_*_route 直接识别为已裁剪格式。
+        # dual_raw=True：输出 boxes/scores（detect）或 boxes/scores/mask_coeff/proto（segment）。
+        # 分割四输出只作为瞬态图，随后由 prepare_seg_onnx_i8_input 规范化为五输出。
         onnx_path = yolo.export(format="onnx", imgsz=imgsz, simplify=True, dual_raw=True, opset=13)
     elif suffix == ".pt":
         raise ValueError(f"普通 .pt 权重不被 Paddle-only 量化入口支持: {weights_path}. 请使用 .pdparams。")
@@ -153,10 +152,9 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
     @details
     自包含实现：仅依赖 cv2 / numpy / pyyaml，不引入 ddyolo26 / paddle，
     在 yolo、paddle 两个 conda 环境均可运行。
-    语义尽量与原 `build_yolo_dataset(..., mode="val", rect=True)` 保持一致：
-    - 先按整套验证集的宽高比排序；
-    - 再按 batch 计算矩形 `batch_shape`（`pad=0.5`, `stride=32`）；
-    - 对每张图执行 **居中** letterbox，且 `scaleup=False`。
+    校准输入严格复用部署语义：固定正方形居中 letterbox，且 `scaleup=False`。
+    为避免按宽高比排序后只取头部样本，先按宽高比排序，再在完整分布上
+    等距抽取 `batch * n_batches` 张代表性图片。
     返回的 batch dict 中 ``img`` 为 uint8 numpy 数组 [B, 3, H, W]。
     @param data_yaml 数据集 YAML 路径。
     @param imgsz 校准图像尺寸（正方形边长）。
@@ -168,6 +166,9 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
     import cv2
     import numpy as np
     from pathlib import Path
+
+    if batch <= 0 or n_batches <= 0:
+        raise ValueError("校准 batch 和 n_batches 必须大于 0")
 
     img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     yaml_path = Path(data_yaml).resolve()
@@ -247,18 +248,19 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
     img_files = [valid_files[i] for i in order]
     aspect_ratios = aspect_ratios[order]
 
-    batch_ids = np.floor(np.arange(len(img_files)) / batch).astype(int)
-    n_total_batches = int(batch_ids[-1] + 1)
-    batch_shapes = np.ones((n_total_batches, 2), dtype=np.int32)
-    for i in range(n_total_batches):
-        batch_ar = aspect_ratios[batch_ids == i]
-        mini, maxi = float(batch_ar.min()), float(batch_ar.max())
-        shape = [1.0, 1.0]
-        if maxi < 1:
-            shape = [maxi, 1.0]
-        elif mini > 1:
-            shape = [1.0, 1.0 / mini]
-        batch_shapes[i] = np.ceil(np.asarray(shape) * imgsz / 32 + 0.5).astype(np.int32) * 32
+    sample_count = min(len(img_files), batch * n_batches)
+    if batch > 1:
+        sample_count -= sample_count % batch
+    if sample_count == 0:
+        raise ValueError(f"可用校准图片不足一个完整 batch：图片={len(img_files)}，batch={batch}")
+    sample_indices = np.linspace(0, len(img_files) - 1, sample_count, dtype=np.int64)
+    img_files = [img_files[int(i)] for i in sample_indices]
+    sampled_ratios = aspect_ratios[sample_indices]
+    print(
+        "[PTQ-Loader] 固定 letterbox="
+        f"{imgsz}x{imgsz}，代表性抽样={sample_count}/{len(valid_files)}，"
+        f"宽高比范围={sampled_ratios.min():.3f}..{sampled_ratios.max():.3f}"
+    )
 
     def _letterbox_rect(img: np.ndarray, new_shape: tuple[int, int]) -> np.ndarray:
         h, w = img.shape[:2]
@@ -283,18 +285,16 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
             value=(114, 114, 114),
         )
 
-    n_target_batches = min(n_batches, n_total_batches)
     batches: list[dict[str, np.ndarray]] = []
-    for batch_idx in range(n_target_batches):
-        rect_shape = tuple(int(v) for v in batch_shapes[batch_idx])
-        idxs = np.where(batch_ids == batch_idx)[0]
+    for batch_idx in range(0, len(img_files), batch):
+        batch_files = img_files[batch_idx : batch_idx + batch]
         imgs = []
-        for idx in idxs:
-            img = cv2.imread(str(img_files[idx]), cv2.IMREAD_COLOR)
+        for image_path in batch_files:
+            img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if img is None:
                 continue
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = _letterbox_rect(img, rect_shape)
+            img = _letterbox_rect(img, (imgsz, imgsz))
             imgs.append(img.transpose(2, 0, 1))
         if imgs:
             batches.append({"img": np.stack(imgs)})
@@ -460,6 +460,10 @@ def quantize_onnx(args):
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
 
     route, prepared_onnx_path, cleanup_paths = prepare_onnx_i8_input(weights_path, args.imgsz)
+    public_route = "predfl" if route == "pre_dfl" else "predist"
+    if args.route and args.route != public_route:
+        cleanup_temp_paths(cleanup_paths)
+        raise ValueError(f"请求 route={args.route}，但模型实际为 {public_route}")
     preprocessed_path = ""
     print(f"[PTQ-ONNX] 已确认路线: {route}")
     print(f"[PTQ-ONNX] 加载 ONNX 模型: {prepared_onnx_path}")
@@ -485,16 +489,12 @@ def quantize_onnx(args):
     count = 0
     for batch_data in loader:
         imgs = batch_data["img"].astype("float32") / 255.0  # [B, 3, H, W]
-        # 确保空间尺寸与 ONNX 完全匹配（rect 模式可能给出不同 H/W）
+        # loader 已按部署输入执行固定 letterbox；尺寸不一致代表调用配置错误。
         if imgs.shape[2] != onnx_h or imgs.shape[3] != onnx_w:
-            import cv2
-
-            resized = []
-            for i in range(imgs.shape[0]):
-                img = imgs[i].transpose(1, 2, 0)  # CHW → HWC
-                img = cv2.resize(img, (onnx_w, onnx_h))
-                resized.append(img.transpose(2, 0, 1))  # HWC → CHW
-            imgs = np.stack(resized)
+            raise ValueError(
+                f"校准预处理尺寸 {imgs.shape[2:]} 与 ONNX 输入 {(onnx_h, onnx_w)} 不一致；"
+                "禁止用拉伸 resize 修补校准数据"
+            )
         # 确保 batch 维度匹配
         if imgs.shape[0] != onnx_batch:
             for i in range(imgs.shape[0]):
@@ -633,6 +633,7 @@ def parse_args() -> argparse.Namespace:
         help="输出路径；默认写到输入权重同目录",
     )
     parser.add_argument("--imgsz", type=int, default=640, help="校准图像尺寸（默认 640）")
+    parser.add_argument("--route", choices=["predist", "predfl"], help="ONNX 模式要求的部署 route")
     parser.add_argument("--batch", type=int, default=4, help="校准数据 batch size（默认 4）")
     parser.add_argument(
         "--calib-batches",

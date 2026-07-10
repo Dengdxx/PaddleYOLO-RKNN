@@ -18,6 +18,8 @@
     BENCH_STATUS           写入每个 bench JSON 的状态，如 official
     BENCH_FREQ_PROFILE     写入每个 bench JSON 的频率口径，如 cpu_npu_ddr_max
     BENCH_SRAM             RKNN SRAM 策略：off / private / shared
+    BENCH_SCORE_SUM        分割五输出预筛：on / off
+    BENCH_INPUT            固定的 HWC RGB uint8 原始帧（正式 E2E 必填）
 """
 
 from __future__ import annotations
@@ -111,8 +113,11 @@ def normalize_bench_meta(meta: dict) -> dict:
     """!
     @brief 兼容不同版本 bench_rknn_perf 的 JSON 字段名。
     """
-    if "npu_pure_ms" not in meta and "npu_wall_avg_ms" in meta:
-        meta["npu_pure_ms"] = meta["npu_wall_avg_ms"]
+    if "npu_pure_ms" not in meta:
+        if "npu_pure_avg_ms" in meta:
+            meta["npu_pure_ms"] = meta["npu_pure_avg_ms"]
+        elif "npu_wall_avg_ms" in meta:
+            meta.setdefault("io_wall_avg_ms", meta["npu_wall_avg_ms"])
     return meta
 
 
@@ -155,6 +160,17 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("BENCH_SRAM", "off"),
         help="传给 bench_rknn_perf 的 RKNN SRAM 策略 (env: BENCH_SRAM)",
     )
+    ap.add_argument(
+        "--score-sum",
+        choices=("on", "off"),
+        default=os.environ.get("BENCH_SCORE_SUM", "on"),
+        help="分割五输出 score_sum 预筛策略 (env: BENCH_SCORE_SUM)",
+    )
+    ap.add_argument(
+        "--input",
+        default=os.environ.get("BENCH_INPUT", ""),
+        help="固定的 HWC RGB uint8 原始帧，用于可复现 E2E 后处理 (env: BENCH_INPUT)",
+    )
     return ap.parse_args()
 
 
@@ -167,6 +183,11 @@ def main() -> None:
         raise SystemExit(f"未找到 bench 可执行文件: {bench}")
     if not os.path.isdir(models_root):
         raise SystemExit(f"未找到模型产物根目录: {models_root}")
+    input_path = os.path.abspath(args.input) if args.input else ""
+    if input_path and not os.path.isfile(input_path):
+        raise SystemExit(f"未找到 bench 输入帧: {input_path}")
+    if args.bench_status == "official" and not input_path:
+        raise SystemExit("official bench 必须通过 --input 或 BENCH_INPUT 指定真实输入帧")
 
     rows: list[dict] = []
     for path, pp in discover_rknn_jobs(models_root):
@@ -191,10 +212,14 @@ def main() -> None:
                 pp,
                 "--sram",
                 args.sram,
+                "--score-sum",
+                args.score_sum,
                 "--json",
                 jp,
             ]
-            print(f"[运行] {stem} core={core} postproc={pp} sram={args.sram}")
+            if input_path:
+                cmd.extend(["--input", input_path])
+            print(f"[运行] {stem} core={core} postproc={pp} sram={args.sram} score_sum={args.score_sum}")
             run(cmd)
             with open(jp) as f:
                 meta = json.load(f)
@@ -204,6 +229,8 @@ def main() -> None:
             if args.frequency_profile:
                 meta["frequency_profile"] = args.frequency_profile
             meta.update({"stem": stem, "model_dir": model_dir})
+            if input_path:
+                meta["input_frame"] = input_path
             with open(jp, "w") as f:
                 json.dump(meta, f, indent=2)
             rows.append(meta)
@@ -212,10 +239,8 @@ def main() -> None:
     print(f"{'model':<55}{'core':<6}{'npu_ms':>9}{'pp_ms':>9}{'e2e_ms':>9}{'fps':>8}")
     for r in rows:
         fps = 1000.0 / r["e2e_avg_ms"]
-        print(
-            f"{r['stem']:<55}{r['core']:<6}{r['npu_pure_ms']:>9.3f}"
-            f"{r['postproc_ms']:>9.3f}{r['e2e_avg_ms']:>9.3f}{fps:>8.1f}"
-        )
+        npu_ms = f"{r['npu_pure_ms']:.3f}" if "npu_pure_ms" in r else "n/a"
+        print(f"{r['stem']:<55}{r['core']:<6}{npu_ms:>9}{r['postproc_ms']:>9.3f}{r['e2e_avg_ms']:>9.3f}{fps:>8.1f}")
 
     summary_path = os.path.abspath(args.summary_out)
     os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)

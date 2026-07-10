@@ -88,7 +88,7 @@ simplify: True # (bool) 仅 ONNX/engine；运行图简化，便于后续 runtime
 opset: # (int, optional) 仅 ONNX/engine；导出 opset 版本；留空使用验证过的默认值
 workspace: # (float, optional) 仅 engine(TensorRT)；workspace 大小 GiB，如 4
 nms: False # (bool) 后端支持时将 NMS 融入导出模型；True 时 conf/iou 生效（coreml 除外）
-dual_raw: False # (bool) 仅 ONNX；导出原始双/四输出（boxes/scores[/mask_coeff/proto]），用于 INT8 主线 pre_dist / pre_dfl / seg_pre_dist
+dual_raw: False # (bool) 仅 ONNX；分割四输出只作中间图，部署前统一规范化为五输出
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
 lr0: 0.01 # (float) 初始学习率（SGD=1e-2，Adam/AdamW=1e-3）

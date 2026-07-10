@@ -25,7 +25,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install development tools
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements-dev.txt numpy
 
       - name: Check formatting
         run: ruff format --check .
@@ -35,6 +35,61 @@ jobs:
 
       - name: Check Python syntax
         run: python -m compileall -q ddyolo26 tools scripts bench quant export train.py
+
+      - name: Check five-output postprocess contract
+        run: |
+          python - <<'PY'
+          import numpy as np
+
+          from tools.eval.cli import (
+              _class_aware_nms_dets,
+              _score_sum_candidates,
+              decode_seg_predfl,
+              decode_seg_predist,
+              nms,
+              sigmoid,
+          )
+
+          boxes = np.array(
+              [[0, 0, 10, 10], [0.5, 0.5, 10.5, 10.5], [20, 20, 30, 30]],
+              dtype=np.float32,
+          )
+          scores = np.array([0.95, 0.94, 0.80], dtype=np.float32)
+          classes = np.zeros(3, dtype=np.float32)
+          old_topk = np.argsort(-scores)[:2]
+          old_keep = old_topk[nms(boxes[old_topk], scores[old_topk], 0.5)]
+          new_dets = _class_aware_nms_dets(boxes, scores, classes, 2, 0.5)
+          assert len(old_keep) == 1 and len(new_dets) == 2
+
+          rng = np.random.default_rng(20260711)
+          logits = rng.normal(-7, 3, size=(5, 8400)).astype(np.float32)
+          class_scores = sigmoid(logits)
+          score_sum = class_scores.sum(axis=0, keepdims=True)[None]
+          candidates = set(_score_sum_candidates(score_sum, 0.25).tolist())
+          positives = set(np.flatnonzero(class_scores.max(axis=0) > 0.25).tolist())
+          assert positives <= candidates
+          assert len(candidates) < logits.shape[1]
+
+          cls_logits = np.array([[[2.0]]], dtype=np.float32)
+          score_sum = sigmoid(cls_logits).sum(axis=1, keepdims=True)
+          coeff = np.array([[[0.25], [-0.5]]], dtype=np.float32)
+          proto = np.ones((1, 2, 2, 2), dtype=np.float32)
+          predist = decode_seg_predist(
+              [np.ones((1, 4, 1), dtype=np.float32), cls_logits, coeff, proto, score_sum],
+              0.25,
+              10,
+              imgsz=8,
+          )
+          predfl = decode_seg_predfl(
+              [np.zeros((1, 1, 8), dtype=np.float32), cls_logits, coeff, proto, score_sum],
+              0.25,
+              10,
+              imgsz=8,
+              reg_max=2,
+          )
+          assert predist["coeffs"].shape == (1, 2)
+          assert predfl["coeffs"].shape == (1, 2)
+          PY
 
       - name: Check version metadata
         run: |

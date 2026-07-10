@@ -26,8 +26,8 @@
   - pre_dfl: 双输出 [1,4*reg_max,N] + [1,nc,N]，CPU 做 DFL + dist2bbox + sigmoid + NMS
   - seg_e2e: 双输出 [1,300,6+nm] + [1,nm,H,W]
   - seg_yolov8_raw: 双输出 [1,4+nc+nm,N] + [1,nm,H,W]
-  - seg_pre_dist: 四输出 [1,4,N] + [1,nc,N] + [1,nm,N] + [1,nm,H,W]
-  - seg_pre_dfl: 四输出 legacy 或五输出 transposed + score_sum
+  - seg_pre_dist: 五输出 [1,4,N] + [1,nc,N] + [1,nm,N] + [1,nm,H,W] + [1,1,N]
+  - seg_pre_dfl: 五输出 [1,N,4*reg_max] + [1,nc,N] + [1,nm,N] + [1,nm,H,W] + [1,1,N]
 
 用法:
     # ONNX FP32 评估自定义数据集
@@ -843,8 +843,8 @@ def detect_output_format(outputs):
     - 双输出 [1,K,6+nm]+[1,nm,H,W]，box 为 xyxy -> `seg_e2e`（YOLO26-seg one2one）
     - 双输出 [1,K,6+nm]+[1,nm,H,W]，box 为 cxcywh -> `seg_yolov8_topk`（YOLOv8 Paddle TopK）
     - 双输出 [1,4+nc+nm,N]+[1,nm,H,W] -> `seg_yolov8_raw`
-    - 四输出 [1,4,N]+[1,nc,N]+[1,nm,N]+[1,nm,H,W] -> `seg_pre_dist`
-    - 四输出 legacy 或五输出 transposed + score_sum -> `seg_pre_dfl`
+    - 五输出 [1,4,N]+cls+coeff+proto+score_sum -> `seg_pre_dist`
+    - 五输出 [1,N,4*reg_max]+cls+coeff+proto+score_sum -> `seg_pre_dfl`
     - 其他 -> `unknown`
     """
     n = len(outputs)
@@ -876,24 +876,77 @@ def detect_output_format(outputs):
             # pre_dfl：`output[0] = [1, 4*reg_max, N]`，其中 `reg_max` 通常为 16
             if b0 % 4 == 0 and b0 > 4:
                 return "pre_dfl"
-    elif n == 4:
-        # seg_pre_dist: 4 输出 [1,4,N] + [1,nc,N] + [1,nm,N] + [1,nm,H,W]
-        if outputs[0].ndim == 3 and outputs[1].ndim == 3 and outputs[3].ndim == 4:
-            c0 = outputs[0].shape[1]
-            if c0 == 4:
-                return "seg_pre_dist"
-            if c0 > 4 and c0 % 4 == 0:
-                return "seg_pre_dfl"
     elif n == 5:
-        # seg_pre_dfl: 5 输出，转置 [1,N,4*reg_max] 或 legacy [1,4*reg_max,N] + score_sum
-        if outputs[0].ndim == 3 and outputs[1].ndim == 3 and outputs[3].ndim == 4:
-            c1 = outputs[0].shape[1]
-            c2 = outputs[0].shape[2]
-            if c2 > 4 and c2 % 4 == 0 and c1 > c2:
-                return "seg_pre_dfl"
-            if c1 > 4 and c1 % 4 == 0 and c2 > c1:
-                return "seg_pre_dfl"
+        # 分割部署格式统一为五输出，末项固定为 score_sum [1,1,N]。
+        for output_format in ("seg_pre_dist", "seg_pre_dfl"):
+            try:
+                _validate_seg_five_outputs(outputs, output_format)
+                return output_format
+            except ValueError:
+                continue
     return "unknown"
+
+
+def _validate_seg_five_outputs(outputs, output_format, expected_anchors=None):
+    """验证五输出分割部署契约并返回解码元数据。
+
+    参数:
+        outputs: 模型五个输出张量。
+        output_format: ``seg_pre_dist`` 或 ``seg_pre_dfl``。
+        expected_anchors: 由输入分辨率和 stride 计算的预期 anchor 数，可选。
+
+    返回:
+        dict: 包含严格对齐的五个输出及 nc/nm/anchor 数。
+
+    异常:
+        ValueError: 输出数量、layout、batch、dtype 或关联维度不符合契约。
+    """
+    if output_format not in ("seg_pre_dist", "seg_pre_dfl"):
+        raise ValueError(f"未知五输出分割格式: {output_format}")
+    if len(outputs) != 5:
+        raise ValueError(f"{output_format} 要求 5 个输出，实际 {len(outputs)}")
+
+    arrays = [np.asarray(output) for output in outputs]
+    for index, output in enumerate(arrays):
+        if not np.issubdtype(output.dtype, np.floating):
+            raise ValueError(f"{output_format} output[{index}] 必须为浮点类型，实际 {output.dtype}")
+        if output.ndim == 0:
+            raise ValueError(f"{output_format} output[{index}] 不得为标量")
+        if output.shape[0] != 1:
+            raise ValueError(f"{output_format} 仅支持 batch=1，output[{index}]={output.shape}")
+
+    raw_box, cls_logits, mask_coeff, proto, score_sum = arrays
+    if cls_logits.ndim != 3 or cls_logits.shape[1] < 1:
+        raise ValueError(f"{output_format} output[1] 必须为 [1,nc,N] 且 nc>=1，实际 {cls_logits.shape}")
+    anchors = cls_logits.shape[2]
+    if anchors < 1 or (expected_anchors is not None and anchors != expected_anchors):
+        raise ValueError(f"{output_format} anchor 数不符合输入网格：实际 {anchors}，预期 {expected_anchors}")
+    if mask_coeff.ndim != 3 or mask_coeff.shape[1] < 1 or mask_coeff.shape[2] != anchors:
+        raise ValueError(f"{output_format} output[2] 必须为 [1,nm,N]，实际 {mask_coeff.shape}")
+    nm = mask_coeff.shape[1]
+    if proto.ndim != 4 or proto.shape[1] != nm or proto.shape[2] < 1 or proto.shape[3] < 1:
+        raise ValueError(f"{output_format} output[3] 必须为 [1,nm,H,W] 且 nm 一致，实际 {proto.shape}")
+    if score_sum.shape != (1, 1, anchors):
+        raise ValueError(f"{output_format} output[4] 必须为 [1,1,N]，实际 {score_sum.shape}")
+    if not np.isfinite(score_sum).all():
+        raise ValueError(f"{output_format} output[4] score_sum 存在非有限值")
+
+    if output_format == "seg_pre_dist":
+        if raw_box.shape != (1, 4, anchors):
+            raise ValueError(f"seg_pre_dist output[0] 必须为 [1,4,N]，实际 {raw_box.shape}")
+    elif not (raw_box.ndim == 3 and raw_box.shape[1] == anchors and raw_box.shape[2] > 4 and raw_box.shape[2] % 4 == 0):
+        raise ValueError(f"seg_pre_dfl output[0] 必须为 [1,N,4*reg_max]，实际 {raw_box.shape}")
+
+    return {
+        "raw_box": raw_box,
+        "cls_logits": cls_logits,
+        "mask_coeff": mask_coeff,
+        "proto": proto,
+        "score_sum": score_sum,
+        "nc": cls_logits.shape[1],
+        "nm": nm,
+        "anchors": anchors,
+    }
 
 
 def decode_e2e(output, conf_thresh, max_det, iou_thresh=0.7):
@@ -1122,6 +1175,60 @@ def _segment_multilabel_nms(prediction, proto, nc, conf_thresh, max_det, iou_thr
         "coeffs": dets_np[:, 6:],
         "proto": proto,
     }
+
+
+def _class_aware_nms_dets(boxes, scores, classes, max_det, iou_thresh, max_nms=30000):
+    """按官方顺序执行分类感知 NMS 并在 NMS 后限制最终数量。
+
+    参数:
+        boxes: ``[N,4]`` xyxy 检测框。
+        scores: ``[N]`` 置信度。
+        classes: ``[N]`` 类别索引。
+        max_det: NMS 后最大检测数。
+        iou_thresh: NMS IoU 阈值。
+        max_nms: NMS 前安全上限，默认对齐 rknn_model_zoo 的 30000。
+
+    返回:
+        np.ndarray: ``[M,6]``，列为 xyxy/score/class，按分数降序。
+    """
+    if len(scores) == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+
+    dets = np.column_stack([boxes, scores, classes]).astype(np.float32)
+    if dets.shape[0] > max_nms:
+        order = np.argsort(-dets[:, 4], kind="stable")[:max_nms]
+        dets = dets[order]
+
+    max_wh = 7680.0
+    boxes_for_nms = dets[:, :4] + dets[:, 5:6] * max_wh
+    keep = nms(boxes_for_nms, dets[:, 4], iou_threshold=iou_thresh)
+    keep = keep[:max_det]
+    return dets[keep]
+
+
+def _score_sum_candidates(score_sum, conf_thresh):
+    """使用五输出 score_sum 安全排除不可能过分类阈值的 anchor。
+
+    ``score_sum`` 为各类 sigmoid 分数之和。对反量化 INT8 输出，从相邻
+    离散值估计一个量化档并降低预筛阈值，避免边界候选被误删。
+    常量输出或当前帧最大 score_sum 不超过阈值时不做预筛：
+    后者可能表示 INT8 上端饱和，无法据此证明真实分数低于阈值。
+
+    参数:
+        score_sum: ``[1,1,N]`` 分数和旁路。
+        conf_thresh: 分类置信度阈值。
+
+    返回:
+        np.ndarray: 可能通过分类阈值的 anchor 索引。
+    """
+    values = score_sum[0, 0].astype(np.float32)
+    unique = np.unique(values)
+    if unique.size <= 1 or values.size == 0 or float(values.max()) <= conf_thresh:
+        return np.arange(values.size, dtype=np.int64)
+    positive_steps = np.diff(unique)
+    positive_steps = positive_steps[positive_steps > 0]
+    margin = float(positive_steps.min()) if positive_steps.size else 0.0
+    return np.flatnonzero(values >= conf_thresh - margin)
 
 
 def decode_seg_e2e(outputs, conf_thresh, max_det, iou_thresh=0.7):
@@ -1406,24 +1513,7 @@ def decode_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, stri
     if len(scores_f) == 0:
         return np.zeros((0, 6), dtype=np.float32)
 
-    if len(scores_f) > max_det:
-        idx = np.argsort(-scores_f)[:max_det]
-        boxes_f, scores_f, cls_f = boxes_f[idx], scores_f[idx], cls_f[idx]
-
-    all_dets = np.column_stack([boxes_f, scores_f, cls_f])
-
-    # 按类别 NMS
-    keep_all = []
-    for c_ in np.unique(cls_f):
-        c_mask = cls_f == c_
-        c_idx = np.where(c_mask)[0]
-        kept = nms(boxes_f[c_mask], scores_f[c_mask], iou_thresh)
-        keep_all.extend(c_idx[kept].tolist())
-
-    all_dets = all_dets[keep_all]
-    if len(all_dets) > max_det:
-        all_dets = all_dets[np.argsort(-all_dets[:, 4])[:max_det]]
-    return all_dets
+    return _class_aware_nms_dets(boxes_f, scores_f, cls_f, max_det, iou_thresh)
 
 
 def _decode_predist_boxes(raw_ltrb, imgsz=640, strides=(8, 16, 32), indices=None):
@@ -1537,34 +1627,20 @@ def decode_predist(
     if len(scores_f) == 0:
         return np.zeros((0, 6), dtype=np.float32)
 
-    if len(scores_f) > max_det:
-        idx = np.argsort(-scores_f)[:max_det]
-        boxes_f, scores_f, cls_f = boxes_f[idx], scores_f[idx], cls_f[idx]
-
-    all_dets = np.column_stack([boxes_f, scores_f, cls_f])
-    keep_all = []
-    for c_ in np.unique(cls_f):
-        c_mask = cls_f == c_
-        c_idx = np.where(c_mask)[0]
-        kept = nms(boxes_f[c_mask], scores_f[c_mask], iou_thresh)
-        keep_all.extend(c_idx[kept].tolist())
-
-    all_dets = all_dets[keep_all]
-    if len(all_dets) > max_det:
-        all_dets = all_dets[np.argsort(-all_dets[:, 4])[:max_det]]
-    return all_dets
+    return _class_aware_nms_dets(boxes_f, scores_f, cls_f, max_det, iou_thresh)
 
 
 def decode_seg_predist(
     outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, strides=(8, 16, 32), predist_postprocess="nms"
 ):
-    """解码 seg_pre_dist 格式四输出，返回 bbox + mask coeff + proto。
+    """解码 seg_pre_dist 五输出，返回 bbox + mask coeff + proto。
 
     输入输出契约（seg_pre_dist）：
       outputs[0]: raw_ltrb  [1, 4, N]     — 步幅空间原始 ltrb
       outputs[1]: cls_logits [1, nc, N]   — 未 sigmoid 的分类 logits
       outputs[2]: mask_coeff [1, nm, N]   — mask 系数
       outputs[3]: proto      [1, nm, H, W] — proto 特征图
+      outputs[4]: score_sum  [1, 1, N]     — 快速背景过滤旁路
 
     后处理流程：
       1. 对 cls_logits 做 sigmoid
@@ -1581,12 +1657,15 @@ def decode_seg_predist(
           coeffs:  [M, nm] mask 系数
           proto:   [nm, H, W] proto 特征图
     """
-    raw_ltrb = outputs[0]  # [1, 4, N]
-    logits = outputs[1][0]  # [nc, N]
-    mask_coeff_full = outputs[2][0]  # [nm, N]
-    proto = outputs[3][0] if outputs[3].ndim == 4 else outputs[3]  # [nm, H, W]
+    expected_anchors = len(_make_anchor_grid(imgsz, strides)[0])
+    contract = _validate_seg_five_outputs(outputs, "seg_pre_dist", expected_anchors)
+    raw_ltrb = contract["raw_box"]
+    logits_full = contract["cls_logits"][0]
+    mask_coeff_full = contract["mask_coeff"][0]
+    proto = contract["proto"][0]
+    candidate_idx = _score_sum_candidates(contract["score_sum"], conf_thresh)
 
-    logits_f32 = np.clip(logits.astype(np.float32), -88, 88)
+    logits_f32 = np.clip(logits_full[:, candidate_idx].astype(np.float32), -88, 88)
     scores = sigmoid(logits_f32)
 
     empty = {
@@ -1597,10 +1676,14 @@ def decode_seg_predist(
         "proto": proto,
     }
 
+    if candidate_idx.size == 0:
+        return empty
+
     if predist_postprocess == "nmsfree_simple":
-        keep_idx, cls_f, scores_f = _select_predist_simple(scores, conf_thresh, max_det)
-        if keep_idx.size == 0:
+        keep_local, cls_f, scores_f = _select_predist_simple(scores, conf_thresh, max_det)
+        if keep_local.size == 0:
             return empty
+        keep_idx = candidate_idx[keep_local]
         boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
         coeffs_f = mask_coeff_full[:, keep_idx].T  # [M, nm]
         return {
@@ -1612,9 +1695,10 @@ def decode_seg_predist(
         }
 
     if predist_postprocess == "nmsfree_exact":
-        keep_idx, cls_f, scores_f = _select_predist_exact(scores, conf_thresh, max_det)
-        if keep_idx.size == 0:
+        keep_local, cls_f, scores_f = _select_predist_exact(scores, conf_thresh, max_det)
+        if keep_local.size == 0:
             return empty
+        keep_idx = candidate_idx[keep_local]
         boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
         coeffs_f = mask_coeff_full[:, keep_idx].T  # [M, nm]
         return {
@@ -1628,12 +1712,13 @@ def decode_seg_predist(
     if predist_postprocess != "nms":
         raise ValueError(f"未知 predist_postprocess: {predist_postprocess}")
 
-    boxes_xyxy = _decode_predist_boxes(raw_ltrb, imgsz, strides)
+    boxes_xyxy = _decode_predist_boxes(raw_ltrb, imgsz, strides, candidate_idx)
+    mask_coeff = mask_coeff_full[:, candidate_idx]
     pred = np.concatenate(
         [
             _xyxy_to_xywh(boxes_xyxy).T,
             scores.astype(np.float32),
-            mask_coeff_full.astype(np.float32),
+            mask_coeff.astype(np.float32),
         ],
         axis=0,
     )[None, ...]
@@ -1641,14 +1726,14 @@ def decode_seg_predist(
 
 
 def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, strides=(8, 16, 32), reg_max=16):
-    """解码 `seg_pre_dfl` 输出（4 或 5 输出），返回 bbox + mask coeff + proto。
+    """解码 `seg_pre_dfl` 五输出，返回 bbox + mask coeff + proto。
 
     输入输出契约（seg_pre_dfl）：
-      outputs[0]: raw_dfl            [1, 4*reg_max, N]（legacy）或 [1, N, 4*reg_max]（transposed）
+      outputs[0]: raw_dfl            [1, N, 4*reg_max]（transposed）
       outputs[1]: cls_logits         [1, nc, N]
       outputs[2]: mask_coeff         [1, nm, N]
       outputs[3]: proto              [1, nm, H, W]
-      outputs[4]: score_sum          [1, 1, N]（可选，5 输出时存在）
+      outputs[4]: score_sum          [1, 1, N]
 
     后处理流程：
       1. 对 raw_dfl 做 softmax-expectation 得到 ltrb；
@@ -1656,15 +1741,13 @@ def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, 
       3. 对 cls_logits 做 sigmoid + per-class NMS；
       4. 按最终 keep_idx gather mask_coeff。
     """
-    raw_dfl = outputs[0]
-    logits = outputs[1][0]
-    mask_coeff_full = outputs[2][0]
-    proto = outputs[3][0] if outputs[3].ndim == 4 else outputs[3]
-
-    # 自动检测布局：转置 [1, N, 4*reg_max] 的 dim2 是 4*reg_max（>4 且整除 4，
-    # 且 N > 4*reg_max）；legacy [1, 4*reg_max, N] 不满足 dim1 > dim2。
-    if raw_dfl.ndim == 3 and raw_dfl.shape[2] > 4 and raw_dfl.shape[2] % 4 == 0 and raw_dfl.shape[1] > raw_dfl.shape[2]:
-        raw_dfl = raw_dfl.transpose(0, 2, 1)
+    expected_anchors = len(_make_anchor_grid(imgsz, strides)[0])
+    contract = _validate_seg_five_outputs(outputs, "seg_pre_dfl", expected_anchors)
+    candidate_idx = _score_sum_candidates(contract["score_sum"], conf_thresh)
+    raw_dfl = contract["raw_box"][:, candidate_idx, :].transpose(0, 2, 1)
+    logits = contract["cls_logits"][0][:, candidate_idx]
+    mask_coeff_full = contract["mask_coeff"][0][:, candidate_idx]
+    proto = contract["proto"][0]
 
     b, c, n = raw_dfl.shape
     if c % 4 != 0 or c <= 4:
@@ -1679,6 +1762,9 @@ def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, 
         "proto": proto,
     }
 
+    if candidate_idx.size == 0:
+        return empty
+
     x = raw_dfl.reshape(b, 4, reg_max, n)
     x = x.transpose(0, 2, 1, 3)
     x_max = x.max(axis=1, keepdims=True)
@@ -1688,6 +1774,8 @@ def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, 
     ltrb = (x * bins[None, :, None, None]).sum(axis=1)
 
     anchors, stride_vals = _make_anchor_grid(imgsz, strides)
+    anchors = anchors[candidate_idx]
+    stride_vals = stride_vals[candidate_idx]
     l, t, r, b_ = ltrb[0]
     ax, ay = anchors[:, 0], anchors[:, 1]
     x1 = (ax - l) * stride_vals
@@ -1767,7 +1855,7 @@ def scale_boxes(dets, scale, pad_w, pad_h):
     return dets
 
 
-def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pad_w, pad_h):
+def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pad_w, pad_h, upsample=True):
     """将 seg_pre_dist / seg_pre_dfl 的 coeff/proto 组装为原图尺寸二值掩码。
 
     参数:
@@ -1778,6 +1866,7 @@ def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pa
         scale: letterbox 缩放比例。
         pad_w: letterbox 左右 padding。
         pad_h: letterbox 上下 padding。
+        upsample: True 使用 native 口径；False 使用 proto 分辨率 fast 口径。
 
     返回:
         np.ndarray: [N, orig_h, orig_w]，uint8 二值掩码。
@@ -1789,6 +1878,21 @@ def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pa
     proto = seg_result["proto"]
     if coeffs.shape[0] == 0:
         return np.zeros((0, orig_h, orig_w), dtype=np.uint8)
+
+    if not upsample:
+        masks_fast = _process_mask_for_eval(proto, coeffs, seg_result["boxes"], (input_h, input_w), upsample=False)
+        proto_h, proto_w = proto.shape[1:]
+        new_w = int(round(orig_w * scale))
+        new_h = int(round(orig_h * scale))
+        left = int(round(pad_w * proto_w / input_w))
+        top = int(round(pad_h * proto_h / input_h))
+        right = int(round((pad_w + new_w) * proto_w / input_w))
+        bottom = int(round((pad_h + new_h) * proto_h / input_h))
+        masks_crop = masks_fast[:, top:bottom, left:right]
+        masks_orig = np.zeros((masks_crop.shape[0], orig_h, orig_w), dtype=np.uint8)
+        for i, mask_i in enumerate(masks_crop):
+            masks_orig[i] = cv2.resize(mask_i, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        return masks_orig
 
     nm, proto_h, proto_w = proto.shape
     masks_raw = coeffs @ proto.reshape(nm, -1)  # [N, proto_h * proto_w]
@@ -2057,7 +2161,7 @@ def _summarize_coco_eval(coco_eval, prefix=""):
 class OnnxBackend:
     """ONNX Runtime 推理后端（用于 PC 端评估）。
 
-    使用 CPU ExecutionProvider 进行推理，输入图像自动完成
+    可用时优先使用 CUDA ExecutionProvider，否则回退 CPU；输入图像自动完成
     uint8->0-1 float32 归一化 + HWC->CHW 转换。
     """
 
@@ -2070,7 +2174,9 @@ class OnnxBackend:
         """
         import onnxruntime as ort
 
-        self.sess = ort.InferenceSession(model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        available = set(ort.get_available_providers())
+        providers = [name for name in ("CUDAExecutionProvider", "CPUExecutionProvider") if name in available]
+        self.sess = ort.InferenceSession(model_path, providers=providers)
         self.input_name = self.sess.get_inputs()[0].name
         self.imgsz = imgsz
 
@@ -2552,7 +2658,16 @@ def evaluate_coco(
             else:
                 seg_result = decode_seg_predfl(outputs, conf, max_det, iou_thresh, imgsz=imgsz)
             seg_result = _limit_coco_result_to_topk(seg_result, min(max_det, 100))
-            seg_masks = _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pad_w, pad_h)
+            seg_masks = _assemble_seg_masks_to_original(
+                seg_result,
+                imgsz,
+                orig_h,
+                orig_w,
+                scale,
+                pad_w,
+                pad_h,
+                upsample=(mask_eval == "native"),
+            )
             dets = (
                 np.column_stack([seg_result["boxes"], seg_result["scores"], seg_result["classes"]]).astype(np.float32)
                 if seg_result["boxes"].shape[0]
@@ -3134,10 +3249,9 @@ def main():
         metrics["imgsz"] = imgsz_text
         if metrics.get("output_format") in ("pre_dist", "seg_pre_dist"):
             metrics["predist_postprocess"] = args.predist_postprocess
-        # `mask_eval` 仅对自定义数据集评估有效；若走 COCO pycocotools 路径，
-        # mask 总会被映射回原图尺寸，因此该字段不参与口径区分。
-        if metrics.get("task") == "segment" and not use_coco_eval:
+        if metrics.get("task") == "segment":
             metrics["mask_eval"] = args.mask_eval
+        if metrics.get("task") == "segment" and not use_coco_eval:
             metrics["overlap_mask"] = args.overlap_mask
         all_results[model_name] = metrics
 

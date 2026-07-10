@@ -6,24 +6,28 @@
 
 ## 1. `bench_rknn_perf` —— 板端 NEON 加速延迟工具
 
-源码：`PaddleYOLO-RKNN/bench/bench_rknn_perf.c`
+源码：`PaddleYOLO-RKNN/bench/bench_rknn_perf.cpp`
 
 ### 功能
 
-- 使用 NEON intrinsics（`int8x16_t -> float32x4_t`）加速 INT8 dequant
-- 对分类分支使用 NEON 融合 `dequant logits + per-anchor max`，并用
-  `logit(conf_thr)` 比较替代 `sigmoid + threshold`，数学等价且少一次全量
-  `expf`/写回
+- 分割 mask 只使用 ROI tiled 路径：ROI 内 INT8 按需反量化、
+  NEON FMLA 合成 logits，再由 OpenCV 完成 ROI resize 与二值化；
+  不保留标量全图 mask 兼容路径
+- 五输出分割先顺序扫描 `score_sum`，仅读取 survivor 对应的
+  multi-label 分类 logits；无法安全预筛时回退 class-major NEON 连续扫描
+- 分类阈值最终仍以精确反量化 logit 和 sigmoid 判定，保持
+  multi-label 与 class-aware NMS 语义
 - 内置四种后处理路径，与 [导出管线](export-pipeline.md) 第 1 节中的 `route` 一一对应：
   - `predist`：YOLO26，`reg_max=1`，4 个距离直接回归
   - `predfl`：YOLOv8，`reg_max=16`，含 DFL softmax-expectation
   - `seg_predist`：分割 predist + mask 后处理
   - `seg_predfl`：YOLOv8-Seg，分割 predfl + mask 后处理
   - `none`：仅推理，跳过后处理
-- 输出延迟三件套（avg / min / max）：
+- 输出延迟统计（best / P50 / P90 / avg）：
   - `npu_pure_ms`：来自 `RKNN_QUERY_PERF_RUN`（NPU 纯耗时）
+  - `io_wall_ms`：inputs_set + run + outputs_get 的主机墙钟耗时
   - `postproc_ms`：CPU + NEON 后处理耗时
-  - `e2e_ms`：端到端（拷贝 + infer + postproc）
+  - `e2e_ms`：端到端（IO wall + postproc + outputs_release）
 
 ### CLI
 
@@ -32,6 +36,8 @@ bench_rknn_perf
   --model M.rknn
   --core 0|1|2|all                # NPU core 绑定
   --postproc predist|predfl|seg_predist|seg_predfl|none
+  --score-sum on|off               # 分割五输出预筛 A/B，默认 on
+  --input F.rgb                    # 单 context 的 HWC RGB uint8 原始帧
   --sram off|private|shared        # RKNN SRAM 初始化策略，默认 off
   --warmup N                       # 默认 10
   --runs N                         # 默认 200
@@ -46,14 +52,18 @@ bench_rknn_perf
 在板端（RK3588 / cortex-a76）：
 
 ```bash
-gcc -O3 -mcpu=cortex-a76 -ffast-math \
+cd bench
+g++ -O3 -DNDEBUG -std=c++17 -mcpu=cortex-a76 \
+    -I. \
     -I<rknn-runtime include 路径> \
-    bench_rknn_perf.c -o bench_rknn_perf \
-    -lrknnrt -lm -pthread
+    $(pkg-config --cflags opencv4) \
+    bench_rknn_perf.cpp postprocess/seg_class_selector.cpp -o bench_rknn_perf \
+    $(pkg-config --libs opencv4) -lrknnrt -pthread
 ```
 
 PaddleYOLO-RKNN 仓库不内置 RKNN Runtime；编译时需要在板端提供本机可用的
-`rknn_api.h` 与 `librknnrt.so` 路径。
+`rknn_api.h` 与 `librknnrt.so` 路径，并安装 `g++`、`pkg-config`
+与 OpenCV 4 开发包。
 
 ### 单跑示例
 
@@ -63,6 +73,12 @@ PaddleYOLO-RKNN 仓库不内置 RKNN Runtime；编译时需要在板端提供本
   --model "$MODELS_ROOT/yolo26n/_eval/yolo26n_paddle_predist_int8_640.rknn" \
   --warmup 5 --runs 50 --core 0 --postproc predist --sram off
 
+# 分割五输出完整后处理；输入为恰好 640×640×3 字节的 HWC RGB uint8 原始帧
+./bench_rknn_perf \
+  --model "$MODELS_ROOT/yolov8n-seg/yolov8n-seg_paddle_seg_predfl_int8_640.rknn" \
+  --input frame_640.rgb --warmup 20 --runs 100 --core all \
+  --postproc seg_predfl --score-sum on
+
 # 2×NPU context 吞吐 / 长压测示例（必须先锁频）
 ./bench_rknn_perf \
   --model "$MODELS_ROOT/yolov8n-seg/yolov8n-seg_paddle_seg_predfl_int8_640.rknn" \
@@ -70,6 +86,18 @@ PaddleYOLO-RKNN 仓库不内置 RKNN Runtime；编译时需要在板端提供本
   --warmup 50 --postproc seg_predfl --sram shared \
   --json "$BENCH_JSON_OUT"
 ```
+
+`seg_predist` / `seg_predfl` 会执行完整的 coeff×proto、上采样、sigmoid、
+bbox crop 与二值化，并报告 mask hash。需要评估第五输出收益时，仅切换
+`--score-sum on|off`；候选数、最终实例数、有效像素与 hash 应保持一致。
+
+survivor-first 差分验证（AArch64 NEON）：
+
+- 10 类×8400 anchor 稀疏夹具中，20 个 survivor 的分类读取量从
+  `84000` 降为 `200`，减少 `99.76%`；500 轮随机量化差分结果与完整扫描一致。
+- 10 类 640 五输出模型的真实图像 A/B 中，`score_sum=on` 实际读取
+  `49×10=490` 个分类值，`off` 读取 `84000` 个；两者均为 49 个候选、
+  9 个 NMS 结果，mask hash 均为 `de998913f2e5b1c8`。
 
 ## 2. 频率锁定
 
@@ -132,18 +160,26 @@ cd <repo>/PaddleYOLO-RKNN
 python scripts/board_bench_all.py \
     --bench ./bench/bench_rknn_perf \
     --models-root "$MODELS_ROOT" \
+    --input frame_640.rgb \
     --summary-out "$MODELS_ROOT/_bench_summary.json" \
     --bench-status official \
     --frequency-profile cpu_npu_ddr_max \
-    --sram off
+    --sram off \
+    --score-sum on
 
 # 或使用环境变量（适合批处理）
 export BENCH_BIN=./bench/bench_rknn_perf
 export BENCH_MODELS_ROOT="$MODELS_ROOT"
+export BENCH_SCORE_SUM=on
+export BENCH_INPUT="$PWD/frame_640.rgb"
 python scripts/board_bench_all.py
 
 # 3. 按板端项目规范恢复 governor
 ```
+
+正式 E2E 数据必须通过 `--input` 或 `BENCH_INPUT` 传入同一张真实帧。
+不传时 bench 使用全零输入，仅适合检查 NPU 运行，不能用于比较
+依赖候选数和 ROI 面积的完整分割后处理延迟。
 
 ---
 
@@ -163,6 +199,10 @@ artifacts/coco_baselines/yolov8n/_eval/
 | `<stem>.bench_coreall.json` | `board_bench_all.py` | RKNN coreall 延迟 |
 
 > 评测使用 `PaddleYOLO-RKNN/tools/eval/`（与 ultralytics `ap_per_class` 对齐），host / 板端、detect / segment 都走这个入口。
+
+分割评估的 `--mask-eval fast|native` 对自定义数据集和 COCO 均生效；COCO
+路径最终都会生成原图尺寸 RLE，但分别保留 proto 分辨率快速口径或 native
+上采样口径，并在结果 JSON 中记录所选口径。
 
 ---
 
