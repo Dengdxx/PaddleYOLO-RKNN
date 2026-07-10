@@ -11,6 +11,14 @@ PaddleYOLO-RKNN 是面向 RKNN 部署的 PaddlePaddle YOLO 工具仓库，覆盖
 > 本仓库包含基于 Ultralytics YOLO 修改而来的派生源码，按 AGPL-3.0 分发。
 > 具体归属规则见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
 
+## 克隆仓库
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Dengdxx/PaddleYOLO-RKNN.git
+```
+
+需要权重时运行 `git -C PaddleYOLO-RKNN lfs pull`。
+
 ## 支持路线
 
 | 场景 | 推荐路线 |
