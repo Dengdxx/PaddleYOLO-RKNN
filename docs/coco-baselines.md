@@ -12,7 +12,7 @@
 - 精度：`fp32` / `int8`
 - 后端：`onnx`（host GPU，ONNX Runtime CUDAExecutionProvider）/ `rknn`（板端，OrangePi 5 RK3588S，NPU）
 
-精度指标由 `python -m tools.eval` 产生，与 Ultralytics `model.val()` 的度量设置一致（`conf=0.001`、`iou=0.7`、letterbox 预处理、自动检测输出格式 + 解码 + NMS）。RKNN 速度指标来自 `bench/bench_rknn_perf.cpp`：`RKNN_QUERY_PERF_RUN` 给出纯 NPU 时间，外层计时给出 `rknn_inputs_set + rknn_run + rknn_outputs_get + ROI/NEON 分割后处理` 的端到端时间。RKNN 速度测试使用 RKNN runtime / toolkit `2.3.2`，CPU/NPU/DDR 锁到 max 频，并为 A/B 传入同一张真实 RGB 帧。
+精度指标由 `python -m tools.eval` 产生，与 Ultralytics `model.val()` 的度量设置一致（`conf=0.001`、`iou=0.7`、letterbox 预处理、自动检测输出格式 + 解码 + NMS）。RKNN 速度指标来自 `bench/bench_rknn_perf.cpp`：`RKNN_QUERY_PERF_RUN` 给出纯 NPU 时间；五输出分割使用 full-IO zero-copy 与按需输出同步，外层端到端计时包含输入同步、NPU、实际需要的输出同步以及 ROI/NEON 后处理。RKNN 速度测试使用 RKNN runtime / toolkit `2.3.2`，CPU/NPU/DDR 锁到 max 频，并为 A/B 传入同一张真实 RGB 帧。
 
 ## 评测命令
 
@@ -104,4 +104,4 @@ python scripts/build_coco_baseline_table.py --markdown
   - 多输出 + DFL → `pre_dfl`
   - seg 多输出 → `seg_pre_dist`
   - seg 多输出 + DFL → `seg_pre_dfl`
-- 解码语义：letterbox + sigmoid 概率 + `conf=0.001` + `iou=0.7` + `max_det=300`。YOLO26 one2one/e2e 保持 NMS-free top-k；YOLOv8 raw 与 Paddle TopK `cxcywh` e2e 路径按类别执行 NMS，避免把候选框编码差异计入精度差异。
+- 解码语义：letterbox + sigmoid 概率 + `conf=0.001` + `iou=0.7` + `max_det=300`。五输出 `seg_pre_dist / seg_pre_dfl` 每个 anchor 仅保留首个最高分类别，再执行 class-aware NMS；YOLO26 one2one/e2e 保持 NMS-free top-k；YOLOv8 raw 与 Paddle TopK `cxcywh` e2e 路径按类别执行 NMS，避免把候选框编码差异计入精度差异。

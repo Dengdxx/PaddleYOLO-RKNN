@@ -96,17 +96,23 @@ score_sum          [1, 1,         N]
 ## CPU 后处理流程
 
 ```text
-1. dequant ltrb / raw_dfl → anchor decode → xyxy（`seg_pre_dfl` 先做 DFL softmax-expectation）
-2. dequant logits → sigmoid → conf / class
-3. conf 过滤 + NMS（或 nmsfree_exact）
-4. gather mask_coeff
-5. dequant proto
-6. coeff @ proto → sigmoid
-7. resize + threshold → binary mask
+1. full-IO zero-copy 运行 NPU
+2. 同步 score_sum；无 survivor 直接结束
+3. 同步 cls，仅对 survivor 做精确 best-class 分类；无 seed 直接结束
+4. 同步 ltrb / raw_dfl，anchor decode + class-aware NMS；无框直接结束
+5. 按 mask 类别白名单过滤；无目标类别直接结束，否则同步 mask_coeff +
+   原生 NC1HWC2 proto
+6. 小 ROI 直接读取 INT8 proto；大 ROI 融合恢复 NCHW FP32
+7. coeff × ROI proto，并在最终写回融合 sigmoid
+8. resize 后单遍量化、threshold → binary mask
 ```
 
-- 评估工具会按严格五输出形状自动识别 `seg_pre_dist / seg_pre_dfl`
+- 评估工具会按严格五输出形状自动识别 `seg_pre_dist / seg_pre_dfl`，并使用与板端 bench 一致的每 anchor best-class 语义
 - 外部消费端按本页的输出契约对接
+- 五输出 C++ bench 对 full-IO 或原生 proto 布局不支持时直接失败，
+  不回退旧取数路线
+- 普通输出恢复同时处理 NCHW、NHWC 和逻辑布局未指定时的宽度 stride；
+  输入缓冲必须与模型逻辑输入字节数严格一致
 
 ## 相关文档
 

@@ -19,6 +19,10 @@
     BENCH_FREQ_PROFILE     写入每个 bench JSON 的频率口径，如 cpu_npu_ddr_max
     BENCH_SRAM             RKNN SRAM 策略：off / private / shared
     BENCH_SCORE_SUM        分割五输出预筛：on / off
+    BENCH_MASK_VERIFY      mask 像素计数/hash 校验：on / off
+    BENCH_IOU_THR          NMS IoU 阈值
+    BENCH_MASK_CLASS_IDS   生成 mask 的类别：all 或逗号分隔 ID
+    BENCH_MASK_OUTPUT_SIZE mask 输出坐标尺寸：WxH
     BENCH_INPUT            固定的 HWC RGB uint8 原始帧（正式 E2E 必填）
 """
 
@@ -171,6 +175,28 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("BENCH_INPUT", ""),
         help="固定的 HWC RGB uint8 原始帧，用于可复现 E2E 后处理 (env: BENCH_INPUT)",
     )
+    ap.add_argument(
+        "--mask-verify",
+        choices=("on", "off"),
+        default=os.environ.get("BENCH_MASK_VERIFY", "off"),
+        help="mask 像素计数/hash 校验，不计入正式 E2E (env: BENCH_MASK_VERIFY)",
+    )
+    ap.add_argument(
+        "--iou-thr",
+        type=float,
+        default=float(os.environ.get("BENCH_IOU_THR", "0.45")),
+        help="NMS IoU 阈值 (env: BENCH_IOU_THR, 默认 0.45)",
+    )
+    ap.add_argument(
+        "--mask-class-ids",
+        default=os.environ.get("BENCH_MASK_CLASS_IDS", "0"),
+        help="生成 mask 的类别：all 或逗号分隔 ID (env: BENCH_MASK_CLASS_IDS)",
+    )
+    ap.add_argument(
+        "--mask-output-size",
+        default=os.environ.get("BENCH_MASK_OUTPUT_SIZE", "640x480"),
+        help="mask 输出坐标尺寸 WxH (env: BENCH_MASK_OUTPUT_SIZE)",
+    )
     return ap.parse_args()
 
 
@@ -214,12 +240,25 @@ def main() -> None:
                 args.sram,
                 "--score-sum",
                 args.score_sum,
+                "--mask-verify",
+                args.mask_verify,
+                "--iou-thr",
+                str(args.iou_thr),
+                "--mask-class-ids",
+                args.mask_class_ids,
+                "--mask-output-size",
+                args.mask_output_size,
                 "--json",
                 jp,
             ]
             if input_path:
                 cmd.extend(["--input", input_path])
-            print(f"[运行] {stem} core={core} postproc={pp} sram={args.sram} score_sum={args.score_sum}")
+            print(
+                f"[运行] {stem} core={core} postproc={pp} sram={args.sram} "
+                f"score_sum={args.score_sum} iou={args.iou_thr} "
+                f"mask_classes={args.mask_class_ids} "
+                f"mask_size={args.mask_output_size}"
+            )
             run(cmd)
             with open(jp) as f:
                 meta = json.load(f)
@@ -236,11 +275,20 @@ def main() -> None:
             rows.append(meta)
 
     print("\n=== 汇总 ===")
-    print(f"{'model':<55}{'core':<6}{'npu_ms':>9}{'pp_ms':>9}{'e2e_ms':>9}{'fps':>8}")
+    print(
+        f"{'model':<55}{'core':<6}{'npu_ms':>9}{'pp_ms':>9}"
+        f"{'sync_KiB':>10}{'e2e_ms':>9}{'fps':>8}{'outcome':>28}"
+    )
     for r in rows:
         fps = 1000.0 / r["e2e_avg_ms"]
         npu_ms = f"{r['npu_pure_ms']:.3f}" if "npu_pure_ms" in r else "n/a"
-        print(f"{r['stem']:<55}{r['core']:<6}{npu_ms:>9}{r['postproc_ms']:>9.3f}{r['e2e_avg_ms']:>9.3f}{fps:>8.1f}")
+        sync_kib = float(r.get("native_sync_bytes", 0.0)) / 1024.0
+        outcome = str(r.get("fetch_outcome", "-"))
+        print(
+            f"{r['stem']:<55}{r['core']:<6}{npu_ms:>9}"
+            f"{r['postproc_ms']:>9.3f}{sync_kib:>10.1f}"
+            f"{r['e2e_avg_ms']:>9.3f}{fps:>8.1f}{outcome:>28}"
+        )
 
     summary_path = os.path.abspath(args.summary_out)
     os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)

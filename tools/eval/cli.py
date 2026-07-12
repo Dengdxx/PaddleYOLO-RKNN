@@ -1121,6 +1121,35 @@ def _xywh_to_xyxy(boxes):
     return xyxy
 
 
+def _segment_class_aware_nms(
+    boxes, scores, classes, coeffs, proto, max_det, iou_thresh
+):
+    """对已选定的分割候选执行 class-aware NMS，并保持 coeff 行对齐。"""
+    if len(scores) == 0:
+        return _empty_seg_result(proto)
+    dets_np = np.column_stack([boxes, scores, classes, coeffs]).astype(np.float32)
+    max_nms = 30000
+    if dets_np.shape[0] > max_nms:
+        order = np.argsort(-dets_np[:, 4], kind="stable")[:max_nms]
+        dets_np = dets_np[order]
+
+    max_wh = 7680.0
+    boxes_for_nms = dets_np[:, :4] + dets_np[:, 5:6] * max_wh
+    keep = nms(boxes_for_nms, dets_np[:, 4], iou_threshold=iou_thresh)
+    keep = keep[:max_det]
+    if len(keep) == 0:
+        return _empty_seg_result(proto)
+    dets_np = dets_np[keep]
+
+    return {
+        "boxes": dets_np[:, :4],
+        "scores": dets_np[:, 4],
+        "classes": dets_np[:, 5],
+        "coeffs": dets_np[:, 6:],
+        "proto": proto,
+    }
+
+
 def _segment_multilabel_nms(prediction, proto, nc, conf_thresh, max_det, iou_thresh):
     """执行 class-aware multi-label NMS，并保留 mask coeff 行对齐。"""
     pred = np.asarray(prediction, dtype=np.float32)
@@ -1143,38 +1172,46 @@ def _segment_multilabel_nms(prediction, proto, nc, conf_thresh, max_det, iou_thr
     cls = x[:, 4 : 4 + nc]
     coeffs = x[:, 4 + nc : 4 + nc + extra]
     anchor_idx, class_idx = np.nonzero(cls > conf_thresh)
-    if anchor_idx.size == 0:
+    return _segment_class_aware_nms(
+        boxes[anchor_idx],
+        cls[anchor_idx, class_idx],
+        class_idx.astype(np.float32),
+        coeffs[anchor_idx],
+        proto,
+        max_det,
+        iou_thresh,
+    )
+
+
+def _segment_best_class_nms(
+    prediction, proto, nc, conf_thresh, max_det, iou_thresh
+):
+    """执行每 anchor best-class 的 class-aware NMS，并保持 mask coeff 对齐。"""
+    pred = np.asarray(prediction, dtype=np.float32)
+    if pred.ndim == 2:
+        pred = pred[None, ...]
+    if pred.shape[0] != 1:
+        raise ValueError(f"当前评估仅支持 batch=1，实际 prediction={pred.shape}")
+
+    extra = pred.shape[1] - nc - 4
+    if extra < 0:
+        raise ValueError(f"prediction 通道数不足：shape={pred.shape}, nc={nc}")
+
+    cls_scores = pred[0, 4 : 4 + nc, :]
+    best_scores = cls_scores.max(axis=0)
+    best_classes = cls_scores.argmax(axis=0)
+    candidate_mask = best_scores > conf_thresh
+    if not candidate_mask.any():
         return _empty_seg_result(proto)
 
-    dets_np = np.column_stack(
-        [
-            boxes[anchor_idx],
-            cls[anchor_idx, class_idx],
-            class_idx.astype(np.float32),
-            coeffs[anchor_idx],
-        ]
-    ).astype(np.float32)
-
-    max_nms = 30000
-    if dets_np.shape[0] > max_nms:
-        order = np.argsort(-dets_np[:, 4])[:max_nms]
-        dets_np = dets_np[order]
-
-    max_wh = 7680.0
-    boxes_for_nms = dets_np[:, :4] + dets_np[:, 5:6] * max_wh
-    keep = nms(boxes_for_nms, dets_np[:, 4], iou_threshold=iou_thresh)
-    keep = keep[:max_det]
-    if len(keep) == 0:
-        return _empty_seg_result(proto)
-    dets_np = dets_np[keep]
-
-    return {
-        "boxes": dets_np[:, :4],
-        "scores": dets_np[:, 4],
-        "classes": dets_np[:, 5],
-        "coeffs": dets_np[:, 6:],
-        "proto": proto,
-    }
+    x = pred[0].T[candidate_mask]
+    boxes = _xywh_to_xyxy(x[:, :4])
+    scores = best_scores[candidate_mask]
+    classes = best_classes[candidate_mask].astype(np.float32)
+    coeffs = x[:, 4 + nc : 4 + nc + extra]
+    return _segment_class_aware_nms(
+        boxes, scores, classes, coeffs, proto, max_det, iou_thresh
+    )
 
 
 def _class_aware_nms_dets(boxes, scores, classes, max_det, iou_thresh, max_nms=30000):
@@ -1643,9 +1680,9 @@ def decode_seg_predist(
       outputs[4]: score_sum  [1, 1, N]     — 快速背景过滤旁路
 
     后处理流程：
-      1. 对 cls_logits 做 sigmoid
-      2. 按 predist_postprocess 选出候选 anchor 及其 keep_idx
-      3. _decode_predist_boxes() 解码 bbox
+      1. 使用 score_sum 安全预筛 anchor，再对 cls_logits 做 sigmoid
+      2. NMS 路径每个 anchor 仅保留最高类别；NMS-free 路径按导出语义选候选
+      3. _decode_predist_boxes() 解码 bbox，并执行所选尾部策略
       4. mask_coeff[:, keep_idx] 做 gather
       5. 返回 dict
 
@@ -1722,7 +1759,7 @@ def decode_seg_predist(
         ],
         axis=0,
     )[None, ...]
-    return _segment_multilabel_nms(pred, proto, scores.shape[0], conf_thresh, max_det, iou_thresh)
+    return _segment_best_class_nms(pred, proto, scores.shape[0], conf_thresh, max_det, iou_thresh)
 
 
 def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, strides=(8, 16, 32), reg_max=16):
@@ -1738,7 +1775,7 @@ def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, 
     后处理流程：
       1. 对 raw_dfl 做 softmax-expectation 得到 ltrb；
       2. 按 anchor grid + stride 解码 xyxy；
-      3. 对 cls_logits 做 sigmoid + per-class NMS；
+      3. 每个 anchor 取 sigmoid 最高类别，再执行 class-aware NMS；
       4. 按最终 keep_idx gather mask_coeff。
     """
     expected_anchors = len(_make_anchor_grid(imgsz, strides)[0])
@@ -1794,7 +1831,7 @@ def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, 
         ],
         axis=0,
     )[None, ...]
-    return _segment_multilabel_nms(pred, proto, scores.shape[0], conf_thresh, max_det, iou_thresh)
+    return _segment_best_class_nms(pred, proto, scores.shape[0], conf_thresh, max_det, iou_thresh)
 
 
 def nms(boxes_xyxy, scores, iou_threshold=0.7):
@@ -1814,7 +1851,7 @@ def nms(boxes_xyxy, scores, iou_threshold=0.7):
         return np.array([], dtype=int)
     x1, y1, x2, y2 = boxes_xyxy[:, 0], boxes_xyxy[:, 1], boxes_xyxy[:, 2], boxes_xyxy[:, 3]
     areas = (x2 - x1) * (y2 - y1)
-    order = np.argsort(-scores)
+    order = np.argsort(-scores, kind="stable")
     keep = []
     while len(order) > 0:
         i = order[0]
