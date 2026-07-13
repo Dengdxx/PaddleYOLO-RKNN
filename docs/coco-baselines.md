@@ -102,6 +102,6 @@ python scripts/build_coco_baseline_table.py --markdown
   - `(1, 4+nc, ≥1000)` → `yolov8_raw`（YOLOv8 8400 锚点 + per-class NMS）
   - 多输出 + reg_max=1 → `pre_dist`
   - 多输出 + DFL → `pre_dfl`
-  - seg 多输出 → `seg_pre_dist`
+  - seg 四输出 raw ltrb → `seg_pre_dist`
   - seg 多输出 + DFL → `seg_pre_dfl`
-- 解码语义：letterbox + sigmoid 概率 + `conf=0.001` + `iou=0.7` + `max_det=300`。五输出 `seg_pre_dist / seg_pre_dfl` 每个 anchor 仅保留首个最高分类别，再执行 class-aware NMS；YOLO26 one2one/e2e 保持 NMS-free top-k；YOLOv8 raw 与 Paddle TopK `cxcywh` e2e 路径按类别执行 NMS，避免把候选框编码差异计入精度差异。
+- 解码语义：YOLO26 `pre_dist/seg_pre_dist` 固定复刻 O2O 两阶段 exact TopK，允许同 anchor 多类别且不执行 NMS；YOLOv8 `pre_dfl/seg_pre_dfl` 执行 DFL、best-class 和 class-aware NMS。

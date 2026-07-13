@@ -7,7 +7,7 @@
 @details
 该脚本用于 `scripts/export_all_models.py` 的跨 conda 环境导出：
 1. 根据输入权重自动导出或复用 seg ONNX；
-2. 裁剪到统一五输出的 `seg_pre_dist` 或 `seg_pre_dfl` 主线；
+2. 裁剪到 YOLO26 四输出 `seg_pre_dist` 或 YOLOv8 五输出 `seg_pre_dfl` 主线；
 3. 使用 ONNX Runtime 静态量化生成 INT8 ONNX。
 """
 
@@ -24,6 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz
+
 
 def parse_args() -> argparse.Namespace:
     """!
@@ -34,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weights", required=True, help="输入权重路径（.pdparams / onnx）")
     p.add_argument("--route", choices=["seg_predist", "seg_predfl"], help="要求的部署 route；不匹配时拒绝导出")
     p.add_argument("--data", required=True, help="校准数据集 YAML")
-    p.add_argument("--imgsz", type=int, default=640, help="输入尺寸")
+    p.add_argument("--imgsz", nargs="+", type=int, default=[640], metavar="SIZE", help="输入尺寸：SIZE 或 H W")
     p.add_argument("--output", default="", help="输出 INT8 ONNX 路径；默认与输入模型同目录")
     p.add_argument("--prepared-output", default="", help="额外保存量化前的 route FP32 ONNX；默认与输入模型同目录")
     p.add_argument("--skip-quant", action="store_true", help="只导出 route FP32 ONNX，不执行 ORT INT8 量化")
@@ -57,16 +59,30 @@ def _base_stem(weights_path: str) -> str:
     return stem.split("_paddle_", 1)[0]
 
 
-def default_prepared_output_path(weights_path: str, route: str, imgsz: int) -> Path:
-    """生成 route FP32 ONNX 默认路径，默认写到输入模型同目录。"""
+def default_prepared_output_path(weights_path: str, route: str, imgsz: StaticInputShape) -> Path:
+    """!
+    @brief 生成 route FP32 ONNX 默认路径。
+    @param weights_path 用户输入权重路径。
+    @param route 分割部署路由。
+    @param imgsz 静态输入尺寸。
+    @return 位于输入模型同目录的默认路径。
+    """
     p = Path(weights_path).resolve()
-    return p.parent / f"{_base_stem(weights_path)}_paddle_{_route_tag(route)}_fp32_{imgsz}.onnx"
+    shape_tag = format_static_imgsz(imgsz)
+    return p.parent / f"{_base_stem(weights_path)}_paddle_{_route_tag(route)}_fp32_{shape_tag}.onnx"
 
 
-def default_int8_output_path(weights_path: str, route: str, imgsz: int) -> Path:
-    """生成 INT8 ONNX 默认路径，默认写到输入模型同目录。"""
+def default_int8_output_path(weights_path: str, route: str, imgsz: StaticInputShape) -> Path:
+    """!
+    @brief 生成 INT8 ONNX 默认路径。
+    @param weights_path 用户输入权重路径。
+    @param route 分割部署路由。
+    @param imgsz 静态输入尺寸。
+    @return 位于输入模型同目录的默认路径。
+    """
     p = Path(weights_path).resolve()
-    return p.parent / f"{_base_stem(weights_path)}_paddle_{_route_tag(route)}_int8_{imgsz}.onnx"
+    shape_tag = format_static_imgsz(imgsz)
+    return p.parent / f"{_base_stem(weights_path)}_paddle_{_route_tag(route)}_int8_{shape_tag}.onnx"
 
 
 def main() -> int:
@@ -75,19 +91,20 @@ def main() -> int:
     @return 成功返回 `0`。
     """
     args = parse_args()
+    imgsz = normalize_static_imgsz(args.imgsz)
 
     from export.seg_onnx_routes import prepare_seg_onnx_i8_input
     from quant.quantize import auto_export_onnx
 
     weights_path = str(Path(args.weights).resolve())
-    route, prepared_path, cleanup = prepare_seg_onnx_i8_input(weights_path, args.imgsz, auto_export_onnx)
+    route, prepared_path, cleanup = prepare_seg_onnx_i8_input(weights_path, imgsz, auto_export_onnx)
     try:
         public_route = _route_tag(route)
         if args.route and args.route != public_route:
             raise ValueError(f"请求 route={args.route}，但模型实际为 {public_route}")
         prepared_output = Path(args.prepared_output).resolve() if args.prepared_output else None
         if prepared_output is None and args.skip_quant:
-            prepared_output = default_prepared_output_path(weights_path, route, args.imgsz)
+            prepared_output = default_prepared_output_path(weights_path, route, imgsz)
         if prepared_output is not None:
             prepared_output.parent.mkdir(parents=True, exist_ok=True)
             if Path(prepared_path).resolve() != prepared_output.resolve():
@@ -109,11 +126,11 @@ def main() -> int:
         from quant.quantize import build_calib_loader
 
         output = (
-            Path(args.output).resolve() if args.output else default_int8_output_path(weights_path, route, args.imgsz)
+            Path(args.output).resolve() if args.output else default_int8_output_path(weights_path, route, imgsz)
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         loader, n_batches = build_calib_loader(
-            str(Path(args.data).resolve()), args.imgsz, batch=1, n_batches=args.calib_batches
+            str(Path(args.data).resolve()), imgsz, batch=1, n_batches=args.calib_batches
         )
 
         m = _onnx.load(prepared_path)

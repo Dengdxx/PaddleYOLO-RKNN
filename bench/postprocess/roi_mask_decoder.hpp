@@ -3,29 +3,28 @@
 
 /**
  * @file roi_mask_decoder.hpp
- * @brief YOLOv8 五输出分割模型的 ROI mask 解码内核。
+ * @brief YOLOv8/YOLO26 分割模型的 ROI mask 解码内核。
  */
 #pragma once
 
-#include "postprocess/five_output_runtime.hpp"
+#include "postprocess/full_io_runtime.hpp"
 
 #include <cstddef>
 #include <cstdint>
-
 #include <opencv2/core.hpp>
 
 namespace paddleyolo_rknn::postprocess {
 
 /** @brief ROI mask 自动解码可选的两条优化路径。 */
 enum class RoiMaskDecodePath {
-  kInt8,   ///< 小 ROI 直接消费原生 INT8 proto。
-  kFloat32 ///< 大 ROI 先融合反量化为 NCHW FP32 proto。
+  kInt8,    ///< 小 ROI 直接消费原生 INT8 proto。
+  kFloat32  ///< 大 ROI 先融合反量化为 NCHW FP32 proto。
 };
 
 /** @brief ROI mask 内核输出激活方式。 */
 enum class RoiMaskActivation {
-  kNone,   ///< 输出原始 logits。
-  kSigmoid ///< 在最终写回时输出 sigmoid 概率。
+  kNone,    ///< 输出原始 logits。
+  kSigmoid  ///< 在最终写回时输出 sigmoid 概率。
 };
 
 /** @brief 自动模式选择 INT8 ROI 路径的最大 proto ROI 总面积。 */
@@ -36,8 +35,7 @@ inline constexpr std::uint64_t kAutoRoiInt8MaxArea = 8000U;
  * @param total_roi_area 所有待解码 ROI 的面积之和。
  * @return 面积不大于阈值时返回 INT8 路径，否则返回 FP32 路径。
  */
-RoiMaskDecodePath
-SelectRoiMaskDecodePath(std::uint64_t total_roi_area) noexcept;
+RoiMaskDecodePath SelectRoiMaskDecodePath(std::uint64_t total_roi_area) noexcept;
 
 /**
  * @brief ROI 内从 FP32 NCHW proto 逐通道累加 mask。
@@ -51,10 +49,9 @@ SelectRoiMaskDecodePath(std::uint64_t total_roi_area) noexcept;
  * `CV_32F`；尺寸匹配时复用内存。
  * @param activation 最终写回时使用的激活方式。
  */
-void ComputeRoiMaskFloat32(
-    const float *proto, int channels, int proto_h, int proto_w,
-    const float *coeff, const cv::Rect &roi, cv::Mat &logits,
-    RoiMaskActivation activation = RoiMaskActivation::kNone);
+void ComputeRoiMaskFloat32(const float *proto, int channels, int proto_h, int proto_w,
+                           const float *coeff, const cv::Rect &roi, cv::Mat &logits,
+                           RoiMaskActivation activation = RoiMaskActivation::kNone);
 
 /**
  * @brief 直接从 RKNN 原生 `NC1HWC2` INT8 proto 计算 ROI mask。
@@ -69,10 +66,9 @@ void ComputeRoiMaskFloat32(
  * `CV_32F`；尺寸匹配时复用内存。
  * @param activation 最终写回时使用的激活方式。
  */
-void ComputeRoiMaskInt8Nc1hwc2(
-    const Nc1hwc2Int8View &proto, const float *coeff, float scale,
-    std::int32_t zero_point, const cv::Rect &roi, cv::Mat &logits,
-    RoiMaskActivation activation = RoiMaskActivation::kNone);
+void ComputeRoiMaskInt8Nc1hwc2(const Nc1hwc2Int8View &proto, const float *coeff, float scale,
+                               std::int32_t zero_point, const cv::Rect &roi, cv::Mat &logits,
+                               RoiMaskActivation activation = RoiMaskActivation::kNone);
 
 /**
  * @brief 将原生 `NC1HWC2` INT8 proto 融合转换为逻辑 NCHW FP32。
@@ -83,9 +79,8 @@ void ComputeRoiMaskInt8Nc1hwc2(
  * @param output_count 输出缓冲区元素容量。
  * @return 转换成功返回 `true`，参数或容量无效时返回 `false`。
  */
-bool DequantizeNc1hwc2Int8ToNchwFloat32(const Nc1hwc2Int8View &proto,
-                                        float scale, std::int32_t zero_point,
-                                        float *output,
+bool DequantizeNc1hwc2Int8ToNchwFloat32(const Nc1hwc2Int8View &proto, float scale,
+                                        std::int32_t zero_point, float *output,
                                         std::size_t output_count) noexcept;
 
 /**
@@ -97,7 +92,7 @@ bool DequantizeNc1hwc2Int8ToNchwFloat32(const Nc1hwc2Int8View &proto,
  * 255。
  * @param[out] binary 输出二值 mask，类型为 `CV_8U`；尺寸匹配时复用内存。
  */
-void AssignBinaryMaskFromProbabilityMat(const cv::Mat &probabilities,
-                                        int threshold_value, cv::Mat &binary);
+void AssignBinaryMaskFromProbabilityMat(const cv::Mat &probabilities, int threshold_value,
+                                        cv::Mat &binary);
 
-} // namespace paddleyolo_rknn::postprocess
+}  // namespace paddleyolo_rknn::postprocess

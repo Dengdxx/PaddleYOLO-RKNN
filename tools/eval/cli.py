@@ -9,8 +9,8 @@
 该脚本统一封装了 YOLO 在 PC 与板端的评估路径，可处理主要输出语义：
 - `e2e`：NMS-free end2end 单输出；
 - `one2one_raw`：保留 one2one 原始头输出，不做传统 NMS；
-- `pre_dist` / `pre_dfl` / `seg_pre_dist` / `seg_pre_dfl`：为 RKNN 部署保留原始回归/分类输出，
-    由 CPU 侧完成后处理。
+- `pre_dist` / `seg_pre_dist`：YOLO26 NMS-free one-to-one 原始输出，CPU 侧固定复制 exact TopK；
+- `pre_dfl` / `seg_pre_dfl`：YOLOv8 原始 DFL 输出，CPU 侧解码并执行 NMS。
 
 这是本仓库 Paddle 模型与 RKNN 导出链路之间的主要评估入口。
 
@@ -22,11 +22,11 @@
 支持五种模型输出格式：
   - e2e:   单输出 [1,300,6]，模型内部已完成 TopK + 置信度筛选
   - one2one_raw: 单输出 [1,4+nc,N]，保留 one2one 原始输出
-  - pre_dist: 双输出 [1,4,N] + [1,nc,N]，CPU 做 dist2bbox + sigmoid + NMS-free/NMS
+  - pre_dist: 双输出 [1,4,N] + [1,nc,N]，CPU 做 dist2bbox + sigmoid + exact TopK
   - pre_dfl: 双输出 [1,4*reg_max,N] + [1,nc,N]，CPU 做 DFL + dist2bbox + sigmoid + NMS
   - seg_e2e: 双输出 [1,300,6+nm] + [1,nm,H,W]
   - seg_yolov8_raw: 双输出 [1,4+nc+nm,N] + [1,nm,H,W]
-  - seg_pre_dist: 五输出 [1,4,N] + [1,nc,N] + [1,nm,N] + [1,nm,H,W] + [1,1,N]
+  - seg_pre_dist: 四输出 [1,4,N] + [1,nc,N] + [1,nm,N] + [1,nm,H,W]
   - seg_pre_dfl: 五输出 [1,N,4*reg_max] + [1,nc,N] + [1,nm,N] + [1,nm,H,W] + [1,1,N]
 
 用法:
@@ -190,15 +190,6 @@ def parse_args():
     )
     p.add_argument("--output", default=None, help="输出 JSON 路径（默认自动命名）")
     p.add_argument("--verbose", action="store_true", help="打印逐类别指标")
-    p.add_argument(
-        "--predist-postprocess",
-        default="nmsfree_exact",
-        choices=["nms", "nmsfree_simple", "nmsfree_exact"],
-        help="pre_dist / seg_pre_dist 路径的 CPU 后处理模式：\n"
-        "  nms            - 现有基线：decode + sigmoid + NMS\n"
-        "  nmsfree_simple - 每个 anchor 仅保留最高类别，不做 NMS\n"
-        "  nmsfree_exact  - 复刻 YOLO26 _postprocess_export 的 top-k/gather 语义",
-    )
     p.add_argument(
         "--mask-eval",
         default="fast",
@@ -843,7 +834,7 @@ def detect_output_format(outputs):
     - 双输出 [1,K,6+nm]+[1,nm,H,W]，box 为 xyxy -> `seg_e2e`（YOLO26-seg one2one）
     - 双输出 [1,K,6+nm]+[1,nm,H,W]，box 为 cxcywh -> `seg_yolov8_topk`（YOLOv8 Paddle TopK）
     - 双输出 [1,4+nc+nm,N]+[1,nm,H,W] -> `seg_yolov8_raw`
-    - 五输出 [1,4,N]+cls+coeff+proto+score_sum -> `seg_pre_dist`
+    - 四输出 [1,4,N]+cls+coeff+proto -> `seg_pre_dist`
     - 五输出 [1,N,4*reg_max]+cls+coeff+proto+score_sum -> `seg_pre_dfl`
     - 其他 -> `unknown`
     """
@@ -876,35 +867,40 @@ def detect_output_format(outputs):
             # pre_dfl：`output[0] = [1, 4*reg_max, N]`，其中 `reg_max` 通常为 16
             if b0 % 4 == 0 and b0 > 4:
                 return "pre_dfl"
+    elif n == 4:
+        try:
+            _validate_seg_outputs(outputs, "seg_pre_dist")
+            return "seg_pre_dist"
+        except ValueError:
+            pass
     elif n == 5:
-        # 分割部署格式统一为五输出，末项固定为 score_sum [1,1,N]。
-        for output_format in ("seg_pre_dist", "seg_pre_dfl"):
-            try:
-                _validate_seg_five_outputs(outputs, output_format)
-                return output_format
-            except ValueError:
-                continue
+        try:
+            _validate_seg_outputs(outputs, "seg_pre_dfl")
+            return "seg_pre_dfl"
+        except ValueError:
+            pass
     return "unknown"
 
 
-def _validate_seg_five_outputs(outputs, output_format, expected_anchors=None):
-    """验证五输出分割部署契约并返回解码元数据。
+def _validate_seg_outputs(outputs, output_format, expected_anchors=None):
+    """验证分割部署契约并返回解码元数据。
 
     参数:
-        outputs: 模型五个输出张量。
+        outputs: 模型输出张量。
         output_format: ``seg_pre_dist`` 或 ``seg_pre_dfl``。
         expected_anchors: 由输入分辨率和 stride 计算的预期 anchor 数，可选。
 
     返回:
-        dict: 包含严格对齐的五个输出及 nc/nm/anchor 数。
+        dict: 包含严格对齐的输出及 nc/nm/anchor 数。
 
     异常:
         ValueError: 输出数量、layout、batch、dtype 或关联维度不符合契约。
     """
-    if output_format not in ("seg_pre_dist", "seg_pre_dfl"):
-        raise ValueError(f"未知五输出分割格式: {output_format}")
-    if len(outputs) != 5:
-        raise ValueError(f"{output_format} 要求 5 个输出，实际 {len(outputs)}")
+    expected_outputs = {"seg_pre_dist": 4, "seg_pre_dfl": 5}
+    if output_format not in expected_outputs:
+        raise ValueError(f"未知分割格式: {output_format}")
+    if len(outputs) != expected_outputs[output_format]:
+        raise ValueError(f"{output_format} 要求 {expected_outputs[output_format]} 个输出，实际 {len(outputs)}")
 
     arrays = [np.asarray(output) for output in outputs]
     for index, output in enumerate(arrays):
@@ -915,7 +911,7 @@ def _validate_seg_five_outputs(outputs, output_format, expected_anchors=None):
         if output.shape[0] != 1:
             raise ValueError(f"{output_format} 仅支持 batch=1，output[{index}]={output.shape}")
 
-    raw_box, cls_logits, mask_coeff, proto, score_sum = arrays
+    raw_box, cls_logits, mask_coeff, proto = arrays[:4]
     if cls_logits.ndim != 3 or cls_logits.shape[1] < 1:
         raise ValueError(f"{output_format} output[1] 必须为 [1,nc,N] 且 nc>=1，实际 {cls_logits.shape}")
     anchors = cls_logits.shape[2]
@@ -926,27 +922,35 @@ def _validate_seg_five_outputs(outputs, output_format, expected_anchors=None):
     nm = mask_coeff.shape[1]
     if proto.ndim != 4 or proto.shape[1] != nm or proto.shape[2] < 1 or proto.shape[3] < 1:
         raise ValueError(f"{output_format} output[3] 必须为 [1,nm,H,W] 且 nm 一致，实际 {proto.shape}")
-    if score_sum.shape != (1, 1, anchors):
-        raise ValueError(f"{output_format} output[4] 必须为 [1,1,N]，实际 {score_sum.shape}")
-    if not np.isfinite(score_sum).all():
-        raise ValueError(f"{output_format} output[4] score_sum 存在非有限值")
-
     if output_format == "seg_pre_dist":
         if raw_box.shape != (1, 4, anchors):
             raise ValueError(f"seg_pre_dist output[0] 必须为 [1,4,N]，实际 {raw_box.shape}")
-    elif not (raw_box.ndim == 3 and raw_box.shape[1] == anchors and raw_box.shape[2] > 4 and raw_box.shape[2] % 4 == 0):
-        raise ValueError(f"seg_pre_dfl output[0] 必须为 [1,N,4*reg_max]，实际 {raw_box.shape}")
+    else:
+        score_sum = arrays[4]
+        if score_sum.shape != (1, 1, anchors):
+            raise ValueError(f"seg_pre_dfl output[4] 必须为 [1,1,N]，实际 {score_sum.shape}")
+        if not np.isfinite(score_sum).all():
+            raise ValueError("seg_pre_dfl output[4] score_sum 存在非有限值")
+        if not (
+            raw_box.ndim == 3
+            and raw_box.shape[1] == anchors
+            and raw_box.shape[2] > 4
+            and raw_box.shape[2] % 4 == 0
+        ):
+            raise ValueError(f"seg_pre_dfl output[0] 必须为 [1,N,4*reg_max]，实际 {raw_box.shape}")
 
-    return {
+    contract = {
         "raw_box": raw_box,
         "cls_logits": cls_logits,
         "mask_coeff": mask_coeff,
         "proto": proto,
-        "score_sum": score_sum,
         "nc": cls_logits.shape[1],
         "nm": nm,
         "anchors": anchors,
     }
+    if output_format == "seg_pre_dfl":
+        contract["score_sum"] = score_sum
+    return contract
 
 
 def decode_e2e(output, conf_thresh, max_det, iou_thresh=0.7):
@@ -1394,7 +1398,7 @@ def decode_seg_yolov8_topk(outputs, conf_thresh, max_det, iou_thresh=0.7):
     }
 
 
-def decode_outputs(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, predist_postprocess="nms"):
+def decode_outputs(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640):
     """自动检测输出格式并解码。
 
     根据 outputs 的数量和形状自动判断格式，调用对应的解码函数。
@@ -1430,16 +1434,12 @@ def decode_outputs(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, pre
             return np.zeros((0, 6), dtype=np.float32)
         return np.column_stack([boxes, result["scores"], result["classes"]]).astype(np.float32)
     elif fmt == "pre_dist":
-        return decode_predist(
-            outputs, conf_thresh, max_det, iou_thresh, imgsz=imgsz, predist_postprocess=predist_postprocess
-        )
+        return decode_predist(outputs, conf_thresh, max_det, imgsz=imgsz)
     elif fmt == "pre_dfl":
         return decode_predfl(outputs, conf_thresh, max_det, iou_thresh, imgsz=imgsz)
     elif fmt == "seg_pre_dist":
         # `seg_pre_dist` 主线中，det 部分直接复用 `pre_dist` 路径（前两个输出）。
-        result = decode_seg_predist(
-            outputs, conf_thresh, max_det, iou_thresh, imgsz=imgsz, predist_postprocess=predist_postprocess
-        )
+        result = decode_seg_predist(outputs, conf_thresh, max_det, imgsz=imgsz)
         boxes = result["boxes"]
         if boxes.shape[0] == 0:
             return np.zeros((0, 6), dtype=np.float32)
@@ -1572,22 +1572,6 @@ def _decode_predist_boxes(raw_ltrb, imgsz=640, strides=(8, 16, 32), indices=None
     return np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
 
 
-def _select_predist_simple(scores, conf_thresh, max_det):
-    """每个 anchor 仅保留最高类别，不做 NMS。"""
-    max_scores = np.max(scores, axis=0)
-    class_ids = np.argmax(scores, axis=0).astype(np.float32)
-
-    keep = np.where(max_scores > conf_thresh)[0]
-    if keep.size == 0:
-        return keep, np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-
-    order = np.argsort(-max_scores[keep], kind="stable")
-    keep = keep[order]
-    if keep.size > max_det:
-        keep = keep[:max_det]
-    return keep, class_ids[keep], max_scores[keep]
-
-
 def _select_predist_exact(scores, conf_thresh, max_det):
     """复刻 YOLO26 _postprocess_export() 的 top-k/gather 语义。"""
     nc, n = scores.shape
@@ -1611,9 +1595,7 @@ def _select_predist_exact(scores, conf_thresh, max_det):
     return final_idx[mask], class_idx[mask], scores_topk[mask]
 
 
-def decode_predist(
-    outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, strides=(8, 16, 32), predist_postprocess="nms"
-):
+def decode_predist(outputs, conf_thresh, max_det, imgsz=640, strides=(8, 16, 32)):
     """解码 pre_dist 格式输出 [1,4,N]+[1,nc,N] -> [M,6]=x1,y1,x2,y2,score,cls。
 
     pre_dist 格式：RKNN 截断点在 dist2bbox+strides 之前，NPU 输出原始 ltrb
@@ -1622,6 +1604,9 @@ def decode_predist(
     适用于 reg_max=1 的 YOLO26 模型（无 DFL Softmax 步骤）。pre_dist 在步幅空间
     保留 raw ltrb（0~10 步幅单位）并在 CPU 侧解码，INT8 分辨率约 0.04 步幅单位
     ≈ 0.32px（P3），更适合当前 RKNN 检测主线。
+
+    YOLO26 为 NMS-free one-to-one 模型，候选选择固定复制导出图的两阶段
+    exact TopK，不提供 best-class 或 NMS 分支。
 
     解码流程（FP16）：
       x1 = (anchor_x - ltrb[l]) * stride
@@ -1635,56 +1620,28 @@ def decode_predist(
     logits_f32 = np.clip(logits.astype(np.float32), -88, 88)
     scores = sigmoid(logits_f32)
 
-    if predist_postprocess == "nmsfree_simple":
-        keep_idx, cls_f, scores_f = _select_predist_simple(scores, conf_thresh, max_det)
-        if keep_idx.size == 0:
-            return np.zeros((0, 6), dtype=np.float32)
-        boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
-        return np.column_stack([boxes_f, scores_f, cls_f]).astype(np.float32)
-
-    if predist_postprocess == "nmsfree_exact":
-        keep_idx, cls_f, scores_f = _select_predist_exact(scores, conf_thresh, max_det)
-        if keep_idx.size == 0:
-            return np.zeros((0, 6), dtype=np.float32)
-        boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
-        return np.column_stack([boxes_f, scores_f, cls_f]).astype(np.float32)
-
-    if predist_postprocess != "nms":
-        raise ValueError(f"未知 predist_postprocess: {predist_postprocess}")
-
-    boxes_xyxy = _decode_predist_boxes(raw_ltrb, imgsz, strides)
-    max_scores = np.max(scores, axis=0)
-    class_ids = np.argmax(scores, axis=0)
-
-    mask = max_scores > conf_thresh
-    boxes_f = boxes_xyxy[mask]
-    scores_f = max_scores[mask]
-    cls_f = class_ids[mask].astype(np.float32)
-
-    if len(scores_f) == 0:
+    keep_idx, cls_f, scores_f = _select_predist_exact(scores, conf_thresh, max_det)
+    if keep_idx.size == 0:
         return np.zeros((0, 6), dtype=np.float32)
+    boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
+    return np.column_stack([boxes_f, scores_f, cls_f]).astype(np.float32)
 
-    return _class_aware_nms_dets(boxes_f, scores_f, cls_f, max_det, iou_thresh)
 
-
-def decode_seg_predist(
-    outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, strides=(8, 16, 32), predist_postprocess="nms"
-):
-    """解码 seg_pre_dist 五输出，返回 bbox + mask coeff + proto。
+def decode_seg_predist(outputs, conf_thresh, max_det, imgsz=640, strides=(8, 16, 32)):
+    """解码 YOLO26-Seg `seg_pre_dist` 四输出，返回 bbox + mask coeff + proto。
 
     输入输出契约（seg_pre_dist）：
       outputs[0]: raw_ltrb  [1, 4, N]     — 步幅空间原始 ltrb
       outputs[1]: cls_logits [1, nc, N]   — 未 sigmoid 的分类 logits
       outputs[2]: mask_coeff [1, nm, N]   — mask 系数
       outputs[3]: proto      [1, nm, H, W] — proto 特征图
-      outputs[4]: score_sum  [1, 1, N]     — 快速背景过滤旁路
 
     后处理流程：
-      1. 使用 score_sum 安全预筛 anchor，再对 cls_logits 做 sigmoid
-      2. NMS 路径每个 anchor 仅保留最高类别；NMS-free 路径按导出语义选候选
-      3. _decode_predist_boxes() 解码 bbox，并执行所选尾部策略
-      4. mask_coeff[:, keep_idx] 做 gather
-      5. 返回 dict
+      1. 对 cls_logits 做 sigmoid；
+      2. 复制 YOLO26 `_postprocess_export()` 的两阶段 exact TopK；
+      3. `_decode_predist_boxes()` 解码入选 bbox；
+      4. `mask_coeff[:, keep_idx]` 做 gather；
+      5. 返回 dict，全程不执行 NMS。
 
     返回:
         dict 包含:
@@ -1695,14 +1652,12 @@ def decode_seg_predist(
           proto:   [nm, H, W] proto 特征图
     """
     expected_anchors = len(_make_anchor_grid(imgsz, strides)[0])
-    contract = _validate_seg_five_outputs(outputs, "seg_pre_dist", expected_anchors)
+    contract = _validate_seg_outputs(outputs, "seg_pre_dist", expected_anchors)
     raw_ltrb = contract["raw_box"]
     logits_full = contract["cls_logits"][0]
     mask_coeff_full = contract["mask_coeff"][0]
     proto = contract["proto"][0]
-    candidate_idx = _score_sum_candidates(contract["score_sum"], conf_thresh)
-
-    logits_f32 = np.clip(logits_full[:, candidate_idx].astype(np.float32), -88, 88)
+    logits_f32 = np.clip(logits_full.astype(np.float32), -88, 88)
     scores = sigmoid(logits_f32)
 
     empty = {
@@ -1713,53 +1668,18 @@ def decode_seg_predist(
         "proto": proto,
     }
 
-    if candidate_idx.size == 0:
+    keep_idx, cls_f, scores_f = _select_predist_exact(scores, conf_thresh, max_det)
+    if keep_idx.size == 0:
         return empty
-
-    if predist_postprocess == "nmsfree_simple":
-        keep_local, cls_f, scores_f = _select_predist_simple(scores, conf_thresh, max_det)
-        if keep_local.size == 0:
-            return empty
-        keep_idx = candidate_idx[keep_local]
-        boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
-        coeffs_f = mask_coeff_full[:, keep_idx].T  # [M, nm]
-        return {
-            "boxes": boxes_f,
-            "scores": scores_f,
-            "classes": cls_f,
-            "coeffs": coeffs_f.astype(np.float32),
-            "proto": proto,
-        }
-
-    if predist_postprocess == "nmsfree_exact":
-        keep_local, cls_f, scores_f = _select_predist_exact(scores, conf_thresh, max_det)
-        if keep_local.size == 0:
-            return empty
-        keep_idx = candidate_idx[keep_local]
-        boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
-        coeffs_f = mask_coeff_full[:, keep_idx].T  # [M, nm]
-        return {
-            "boxes": boxes_f,
-            "scores": scores_f,
-            "classes": cls_f,
-            "coeffs": coeffs_f.astype(np.float32),
-            "proto": proto,
-        }
-
-    if predist_postprocess != "nms":
-        raise ValueError(f"未知 predist_postprocess: {predist_postprocess}")
-
-    boxes_xyxy = _decode_predist_boxes(raw_ltrb, imgsz, strides, candidate_idx)
-    mask_coeff = mask_coeff_full[:, candidate_idx]
-    pred = np.concatenate(
-        [
-            _xyxy_to_xywh(boxes_xyxy).T,
-            scores.astype(np.float32),
-            mask_coeff.astype(np.float32),
-        ],
-        axis=0,
-    )[None, ...]
-    return _segment_best_class_nms(pred, proto, scores.shape[0], conf_thresh, max_det, iou_thresh)
+    boxes_f = _decode_predist_boxes(raw_ltrb, imgsz, strides, keep_idx)
+    coeffs_f = mask_coeff_full[:, keep_idx].T  # [M, nm]
+    return {
+        "boxes": boxes_f,
+        "scores": scores_f,
+        "classes": cls_f,
+        "coeffs": coeffs_f.astype(np.float32),
+        "proto": proto,
+    }
 
 
 def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, strides=(8, 16, 32), reg_max=16):
@@ -1779,7 +1699,7 @@ def decode_seg_predfl(outputs, conf_thresh, max_det, iou_thresh=0.7, imgsz=640, 
       4. 按最终 keep_idx gather mask_coeff。
     """
     expected_anchors = len(_make_anchor_grid(imgsz, strides)[0])
-    contract = _validate_seg_five_outputs(outputs, "seg_pre_dfl", expected_anchors)
+    contract = _validate_seg_outputs(outputs, "seg_pre_dfl", expected_anchors)
     candidate_idx = _score_sum_candidates(contract["score_sum"], conf_thresh)
     raw_dfl = contract["raw_box"][:, candidate_idx, :].transpose(0, 2, 1)
     logits = contract["cls_logits"][0][:, candidate_idx]
@@ -2613,7 +2533,6 @@ def evaluate_coco(
     iou_thresh,
     max_det,
     max_images=None,
-    predist_postprocess="nms",
     mask_eval="fast",
 ):
     """使用 pycocotools 官方评估流程评估 COCO 数据集（nc=80）。
@@ -2684,14 +2603,7 @@ def evaluate_coco(
             elif output_format == "seg_yolov8_raw":
                 seg_result = decode_seg_yolov8_raw(outputs, conf, max_det, iou_thresh)
             elif output_format == "seg_pre_dist":
-                seg_result = decode_seg_predist(
-                    outputs,
-                    conf,
-                    max_det,
-                    iou_thresh,
-                    imgsz=imgsz,
-                    predist_postprocess=predist_postprocess,
-                )
+                seg_result = decode_seg_predist(outputs, conf, max_det, imgsz=imgsz)
             else:
                 seg_result = decode_seg_predfl(outputs, conf, max_det, iou_thresh, imgsz=imgsz)
             seg_result = _limit_coco_result_to_topk(seg_result, min(max_det, 100))
@@ -2732,9 +2644,7 @@ def evaluate_coco(
                     }
                 )
         else:
-            dets = decode_outputs(
-                outputs, conf, max_det, iou_thresh, imgsz=imgsz, predist_postprocess=predist_postprocess
-            )
+            dets = decode_outputs(outputs, conf, max_det, iou_thresh, imgsz=imgsz)
             dets = _limit_coco_dets_to_topk(dets, min(max_det, 100))
             dets = scale_boxes(dets, scale, pad_w, pad_h)
 
@@ -2846,7 +2756,6 @@ def evaluate_yolo(
     max_det,
     max_images=None,
     verbose=False,
-    predist_postprocess="nms",
     mask_eval="fast",
     overlap_mask=True,
 ):
@@ -2925,14 +2834,7 @@ def evaluate_yolo(
             elif output_format == "seg_yolov8_raw":
                 seg_result = decode_seg_yolov8_raw(outputs, conf, max_det, iou_thresh)
             elif output_format == "seg_pre_dist":
-                seg_result = decode_seg_predist(
-                    outputs,
-                    conf,
-                    max_det,
-                    iou_thresh,
-                    imgsz=imgsz,
-                    predist_postprocess=predist_postprocess,
-                )
+                seg_result = decode_seg_predist(outputs, conf, max_det, imgsz=imgsz)
             else:
                 seg_result = decode_seg_predfl(outputs, conf, max_det, iou_thresh, imgsz=imgsz)
             pred_masks = _assemble_seg_masks_for_eval(seg_result, imgsz, upsample=(mask_eval == "native"))
@@ -2970,9 +2872,7 @@ def evaluate_yolo(
             )
             gt_masks = _resize_gt_masks_for_eval(gt_masks, pred_masks.shape[1:])
         else:
-            dets = decode_outputs(
-                outputs, conf, max_det, iou_thresh, imgsz=imgsz, predist_postprocess=predist_postprocess
-            )
+            dets = decode_outputs(outputs, conf, max_det, iou_thresh, imgsz=imgsz)
             if len(dets) > 0:
                 pred_boxes = dets[:, :4]
                 pred_scores = dets[:, 4]
@@ -3237,8 +3137,6 @@ def main():
         print(f"模型: {model_name}  (imgsz={imgsz_text})")
         print(f"{'=' * 70}")
 
-        print(f"  predist_postprocess={args.predist_postprocess} (仅 pre_dist / seg_pre_dist 生效)")
-
         try:
             engine = make_backend(args.backend, model_path, imgsz, args.core)
 
@@ -3252,7 +3150,6 @@ def main():
                     args.iou,
                     args.max_det,
                     args.max_images,
-                    predist_postprocess=args.predist_postprocess,
                     mask_eval=args.mask_eval,
                 )
             else:
@@ -3269,7 +3166,6 @@ def main():
                     args.max_det,
                     args.max_images,
                     args.verbose,
-                    predist_postprocess=args.predist_postprocess,
                     mask_eval=args.mask_eval,
                     overlap_mask=args.overlap_mask,
                 )
@@ -3284,8 +3180,6 @@ def main():
             continue
 
         metrics["imgsz"] = imgsz_text
-        if metrics.get("output_format") in ("pre_dist", "seg_pre_dist"):
-            metrics["predist_postprocess"] = args.predist_postprocess
         if metrics.get("task") == "segment":
             metrics["mask_eval"] = args.mask_eval
         if metrics.get("task") == "segment" and not use_coco_eval:

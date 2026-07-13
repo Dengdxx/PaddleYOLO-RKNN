@@ -131,7 +131,7 @@ python export/export_seg_rknn_i8.py \
 - 板端延迟与评估：[板端延迟与评估表](docs/bench-and-eval.md)
 - COCO baseline：[COCO val2017 baseline](docs/coco-baselines.md)
 
-五输出分割 bench 默认使用 full-IO zero-copy、分阶段输出同步和原生
+分割 bench 按模型族使用四/五输出 full-IO zero-copy、分阶段输出同步和原生
 `NC1HWC2` ROI mask 后处理，不保留旧分割取数路线。正式延迟默认关闭
 mask hash 校验；需要做输出一致性 A/B 时显式传入 `--mask-verify on`。
 

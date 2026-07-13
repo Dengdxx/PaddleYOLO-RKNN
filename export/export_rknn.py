@@ -338,7 +338,10 @@ def main() -> int:
     model = onnx.load(onnx_path)
     output_ranks = [len(output.type.tensor_type.shape.dim) for output in model.graph.output]
     if 4 in output_ranks:
-        raise SystemExit("通用 FP16 入口不支持分割模型；请使用 export_seg_rknn_i8.py，确保部署产物满足统一五输出契约。")
+        raise SystemExit(
+            "通用 FP16 入口不支持分割模型；请使用 export_seg_rknn_i8.py，"
+            "生成 YOLO26 四输出或 YOLOv8 五输出部署产物。"
+        )
     prepared_onnx = prepare_onnx(onnx_path, fix_paddle=not args.no_fix)
 
     if args.output:

@@ -36,7 +36,7 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q ddyolo26 tools scripts bench quant export train.py
 
-      - name: Check five-output postprocess contract
+      - name: Check family-specific postprocess contracts
         run: |
           python - <<'PY'
           import numpy as np
@@ -70,25 +70,28 @@ jobs:
           assert positives <= candidates
           assert len(candidates) < logits.shape[1]
 
-          cls_logits = np.array([[[2.0]]], dtype=np.float32)
+          cls_logits = np.array([[[4.0, -4.0], [3.0, -5.0]]], dtype=np.float32)
           score_sum = sigmoid(cls_logits).sum(axis=1, keepdims=True)
-          coeff = np.array([[[0.25], [-0.5]]], dtype=np.float32)
+          coeff = np.array([[[0.25, 0.75], [-0.5, 0.5]]], dtype=np.float32)
           proto = np.ones((1, 2, 2, 2), dtype=np.float32)
           predist = decode_seg_predist(
-              [np.ones((1, 4, 1), dtype=np.float32), cls_logits, coeff, proto, score_sum],
+              [np.ones((1, 4, 2), dtype=np.float32), cls_logits, coeff, proto],
               0.25,
-              10,
-              imgsz=8,
+              2,
+              imgsz=(8, 16),
+              strides=(8,),
           )
           predfl = decode_seg_predfl(
-              [np.zeros((1, 1, 8), dtype=np.float32), cls_logits, coeff, proto, score_sum],
+              [np.zeros((1, 2, 8), dtype=np.float32), cls_logits, coeff, proto, score_sum],
               0.25,
-              10,
-              imgsz=8,
+              2,
+              imgsz=(8, 16),
+              strides=(8,),
               reg_max=2,
           )
-          assert predist["coeffs"].shape == (1, 2)
-          assert predfl["coeffs"].shape == (1, 2)
+          assert predist["coeffs"].shape == (2, 2)
+          assert predist["classes"].tolist() == [0.0, 1.0]
+          assert predfl["coeffs"].shape[1] == 2
           PY
 
       - name: Check version metadata

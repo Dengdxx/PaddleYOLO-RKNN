@@ -21,7 +21,7 @@ import numpy as np
 import paddle
 
 from ddyolo26.models.yolo.detect import DetectionValidator
-from ddyolo26.models.yolo.segment.predict import _decode_rknn_seg_five_outputs, _is_seg_five_outputs
+from ddyolo26.models.yolo.segment.predict import _decode_rknn_seg_outputs, _is_rknn_seg_outputs
 from ddyolo26.utils import LOGGER, ops
 from ddyolo26.utils.checks import check_requirements
 from ddyolo26.utils.metrics import SegmentMetrics, mask_iou
@@ -107,10 +107,10 @@ class SegmentationValidator(DetectionValidator):
             (list[dict[str, paddle.Tensor]]): 处理后的检测结果字典列表，含 masks。
         """
         if getattr(self, "_rknn_backend", False):
-            if not _is_seg_five_outputs(preds):
+            if not _is_rknn_seg_outputs(preds):
                 count = len(preds) if isinstance(preds, (list, tuple)) else type(preds).__name__
-                raise ValueError(f"RKNN 分割模型必须返回五输出，实际 {count}")
-            detections, proto = _decode_rknn_seg_five_outputs(
+                raise ValueError(f"RKNN 分割模型必须返回 YOLO26 四输出或 YOLOv8 五输出，实际 {count}")
+            detections, proto = _decode_rknn_seg_outputs(
                 preds,
                 self.args.imgsz,
                 self.args.conf,

@@ -21,18 +21,22 @@
  * 加速候选筛选、dequant 与 mask
  *   - 离线 FPS          多 RKNN context 并发循环，不接摄像头/ROS/真实预处理
  *
- * 后处理路线 (NEON best-class 阈值扫描 + candidate-first decode):
+ * 后处理路线：
  *   predist (reg_max=1):
- *     scores: [1,nc,A] i8  → INT8 best-class 阈值扫描
- *     boxes:  [1,4,A]  i8  → 仅对候选 anchor dequant ltrb
+ *     YOLO26 O2O 头，两阶段 stable exact TopK，不执行 NMS
  *   predfl (reg_max=16):
- *     scores: [1,nc,A] i8  → INT8 best-class 阈值扫描
- *     boxes:  [1,64,A] i8  → 仅对候选 anchor softmax(16) → · arange(16) → ltrb
+ *     YOLOv8 分类扫描 + DFL 解码 + class-aware NMS
  *   seg_predist:
- *     score_sum 先筛 anchor，再扫描 survivor 的分类并按需处理 mask
+ *     YOLO26-Seg 四输出，O2O exact TopK + mask，不执行 NMS
  *   seg_predfl:
- *     score_sum 先筛 anchor，再扫描 survivor 的分类/DFL 并按需处理 mask
+ *     YOLOv8-Seg 五输出，score_sum + best-class + NMS + mask
  */
+
+#include "postprocess/full_io_runtime.hpp"
+#include "postprocess/nmsfree_topk_selector.hpp"
+#include "postprocess/roi_mask_decoder.hpp"
+#include "postprocess/seg_class_selector.hpp"
+#include "rknn_api.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -43,20 +47,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
-#include <vector>
-
 #include <getopt.h>
-#include <pthread.h>
-#include <time.h>
-
+#include <limits>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-
-#include "postprocess/five_output_runtime.hpp"
-#include "postprocess/roi_mask_decoder.hpp"
-#include "postprocess/seg_class_selector.hpp"
-#include "rknn_api.h"
+#include <pthread.h>
+#include <time.h>
+#include <vector>
 
 #if !defined(__aarch64__) || !defined(__ARM_NEON)
 #error "bench_rknn_perf requires AArch64 NEON"
@@ -87,20 +84,25 @@ typedef struct {
 static thread_local float *g_mb = nullptr, *g_pb = nullptr;
 static thread_local float *g_roi_storage = nullptr, *g_resize_storage = nullptr;
 static thread_local float *g_dfl_logits = nullptr;
+static thread_local int8_t *g_anchor_max_logits = nullptr;
 static thread_local uint8_t *g_binary_storage = nullptr;
 static thread_local uint8_t *g_suppressed = nullptr;
 static thread_local candidate_t *g_candidates = nullptr;
-static thread_local paddleyolo_rknn::postprocess::ClassSeed *g_class_seeds =
-    nullptr;
+static thread_local paddleyolo_rknn::postprocess::ClassSeed *g_class_seeds = nullptr;
 static thread_local int *g_score_sum_survivors = nullptr;
+static thread_local paddleyolo_rknn::postprocess::NmsFreeRankedValue *g_anchor_ranking = nullptr;
+static thread_local paddleyolo_rknn::postprocess::NmsFreeRankedValue *g_gathered_ranking = nullptr;
 static thread_local int *g_mask_candidate_indices = nullptr;
 static thread_local int g_lm = 0, g_lp = 0;
 static thread_local int g_lroi = 0, g_lresize = 0, g_lbinary = 0;
 static thread_local int g_ldfl_logits = 0;
+static thread_local int g_lanchor_max_logits = 0;
 static thread_local int g_lsuppressed = 0;
 static thread_local int g_lcandidates = 0;
 static thread_local int g_lclass_seeds = 0;
 static thread_local int g_lscore_sum_survivors = 0;
+static thread_local int g_lanchor_ranking = 0;
+static thread_local int g_lgathered_ranking = 0;
 static thread_local int g_lmask_candidate_indices = 0;
 static thread_local int g_last_kept = 0;
 static thread_local int g_last_candidates = 0;
@@ -143,10 +145,13 @@ static void free_postproc_buffers(void) {
   free(g_resize_storage);
   free(g_binary_storage);
   free(g_dfl_logits);
+  free(g_anchor_max_logits);
   free(g_suppressed);
   free(g_candidates);
   free(g_class_seeds);
   free(g_score_sum_survivors);
+  free(g_anchor_ranking);
+  free(g_gathered_ranking);
   free(g_mask_candidate_indices);
   g_mb = nullptr;
   g_pb = nullptr;
@@ -154,10 +159,13 @@ static void free_postproc_buffers(void) {
   g_resize_storage = nullptr;
   g_binary_storage = nullptr;
   g_dfl_logits = nullptr;
+  g_anchor_max_logits = nullptr;
   g_suppressed = nullptr;
   g_candidates = nullptr;
   g_class_seeds = nullptr;
   g_score_sum_survivors = nullptr;
+  g_anchor_ranking = nullptr;
+  g_gathered_ranking = nullptr;
   g_mask_candidate_indices = nullptr;
   g_lm = 0;
   g_lp = 0;
@@ -165,10 +173,13 @@ static void free_postproc_buffers(void) {
   g_lresize = 0;
   g_lbinary = 0;
   g_ldfl_logits = 0;
+  g_lanchor_max_logits = 0;
   g_lsuppressed = 0;
   g_lcandidates = 0;
   g_lclass_seeds = 0;
   g_lscore_sum_survivors = 0;
+  g_lanchor_ranking = 0;
+  g_lgathered_ranking = 0;
   g_lmask_candidate_indices = 0;
   g_last_kept = 0;
   g_last_candidates = 0;
@@ -194,7 +205,9 @@ static void free_postproc_buffers(void) {
   g_sink = 0.f;
 }
 
-static size_t round_up_64(size_t bytes) { return (bytes + 63U) & ~size_t{63U}; }
+static size_t round_up_64(size_t bytes) {
+  return (bytes + 63U) & ~size_t{63U};
+}
 
 static float *ensure(float **p, int *cap, int need) {
   if (need > *cap) {
@@ -233,8 +246,7 @@ static int *ensure_int(int **p, int *cap, int need) {
 static candidate_t *ensure_candidates(int need) {
   if (need > g_lcandidates) {
     free(g_candidates);
-    const size_t bytes =
-        round_up_64(static_cast<size_t>(need) * sizeof(candidate_t));
+    const size_t bytes = round_up_64(static_cast<size_t>(need) * sizeof(candidate_t));
     g_candidates = (candidate_t *)aligned_alloc(64, bytes);
     g_lcandidates = g_candidates != nullptr ? need : 0;
   }
@@ -249,21 +261,38 @@ static candidate_t *ensure_candidates(int need) {
 static paddleyolo_rknn::postprocess::ClassSeed *ensure_class_seeds(int need) {
   if (need > g_lclass_seeds) {
     free(g_class_seeds);
-    const size_t bytes =
-        round_up_64(static_cast<size_t>(need) * sizeof(*g_class_seeds));
-    g_class_seeds = static_cast<paddleyolo_rknn::postprocess::ClassSeed *>(
-        aligned_alloc(64, bytes));
+    const size_t bytes = round_up_64(static_cast<size_t>(need) * sizeof(*g_class_seeds));
+    g_class_seeds =
+        static_cast<paddleyolo_rknn::postprocess::ClassSeed *>(aligned_alloc(64, bytes));
     g_lclass_seeds = g_class_seeds != nullptr ? need : 0;
   }
   return g_class_seeds;
+}
+
+/**
+ * @brief 确保 NMS-free stable TopK 排序 scratch 容量充足。
+ * @param buffer 待扩容的缓冲区指针。
+ * @param capacity 当前元素容量。
+ * @param need 需要的元素数。
+ * @return 可用缓冲区；分配失败时返回 nullptr。
+ */
+static paddleyolo_rknn::postprocess::NmsFreeRankedValue *ensure_ranked_values(
+    paddleyolo_rknn::postprocess::NmsFreeRankedValue **buffer, int *capacity, int need) {
+  if (need > *capacity) {
+    free(*buffer);
+    const size_t bytes = round_up_64(static_cast<size_t>(need) * sizeof(**buffer));
+    *buffer =
+        static_cast<paddleyolo_rknn::postprocess::NmsFreeRankedValue *>(aligned_alloc(64, bytes));
+    *capacity = *buffer != nullptr ? need : 0;
+  }
+  return *buffer;
 }
 
 static inline float dequant_i8_value(int8_t value, int32_t zp, float scale) {
   return ((float)((int32_t)value - zp)) * scale;
 }
 
-static bool candidate_score_greater(const candidate_t &a,
-                                    const candidate_t &b) {
+static bool candidate_score_greater(const candidate_t &a, const candidate_t &b) {
   if (a.score != b.score)
     return a.score > b.score;
   if (a.anchor != b.anchor)
@@ -274,8 +303,7 @@ static bool candidate_score_greater(const candidate_t &a,
 static void anchor_geometry(int anchor, float *cx, float *cy, float *stride) {
   static const int strides[] = {8, 16, 32};
   int offset = anchor;
-  for (size_t level = 0; level < sizeof(strides) / sizeof(strides[0]);
-       level++) {
+  for (size_t level = 0; level < sizeof(strides) / sizeof(strides[0]); level++) {
     int s = strides[level];
     int gh = g_input_h / s;
     int gw = g_input_w / s;
@@ -297,21 +325,17 @@ static inline float32x4_t neon_exp_fast4(float32x4_t x) {
   const float32x4_t y = vmulq_n_f32(x, 1.4426950408889634f);
   const int32x4_t exponent = vcvtmq_s32_f32(y);
   const float32x4_t fraction = vsubq_f32(y, vcvtq_f32_s32(exponent));
-  float32x4_t polynomial =
-      vmlaq_n_f32(vdupq_n_f32(0.0096181291f), fraction, 0.0013333558f);
+  float32x4_t polynomial = vmlaq_n_f32(vdupq_n_f32(0.0096181291f), fraction, 0.0013333558f);
   polynomial = vmlaq_f32(vdupq_n_f32(0.0555041087f), polynomial, fraction);
   polynomial = vmlaq_f32(vdupq_n_f32(0.2402265070f), polynomial, fraction);
   polynomial = vmlaq_f32(vdupq_n_f32(0.6931471805f), polynomial, fraction);
   polynomial = vmlaq_f32(vdupq_n_f32(1.0f), polynomial, fraction);
-  const int32x4_t exponent_bits =
-      vshlq_n_s32(vaddq_s32(exponent, vdupq_n_s32(127)), 23);
+  const int32x4_t exponent_bits = vshlq_n_s32(vaddq_s32(exponent, vdupq_n_s32(127)), 23);
   return vmulq_f32(polynomial, vreinterpretq_f32_s32(exponent_bits));
 }
 
-static bool decode_dfl_expectation4(const int8_t *boxes,
-                                    const rknn_tensor_attr *attr, int anchor,
-                                    int anchors, int reg_max, int transposed,
-                                    float output[4]) {
+static bool decode_dfl_expectation4(const int8_t *boxes, const rknn_tensor_attr *attr, int anchor,
+                                    int anchors, int reg_max, int transposed, float output[4]) {
   float *logits = ensure(&g_dfl_logits, &g_ldfl_logits, 4 * reg_max);
   if (logits == nullptr)
     return false;
@@ -320,14 +344,12 @@ static bool decode_dfl_expectation4(const int8_t *boxes,
   if (transposed) {
     const int8_t *source = boxes + static_cast<size_t>(anchor) * channels;
     for (int channel = 0; channel < channels; ++channel) {
-      logits[channel] =
-          (static_cast<float>(source[channel]) - zero_point) * attr->scale;
+      logits[channel] = (static_cast<float>(source[channel]) - zero_point) * attr->scale;
     }
   } else {
     for (int channel = 0; channel < channels; ++channel) {
       logits[channel] =
-          (static_cast<float>(
-               boxes[static_cast<size_t>(channel) * anchors + anchor]) -
+          (static_cast<float>(boxes[static_cast<size_t>(channel) * anchors + anchor]) -
            zero_point) *
           attr->scale;
     }
@@ -348,10 +370,9 @@ static bool decode_dfl_expectation4(const int8_t *boxes,
     const float32x4_t lane = {0.0f, 1.0f, 2.0f, 3.0f};
     bin = 0;
     for (; bin + 4 <= reg_max; bin += 4) {
-      const float32x4_t weight = neon_exp_fast4(
-          vsubq_f32(vld1q_f32(side_logits + bin), vdupq_n_f32(maximum)));
-      const float32x4_t index =
-          vaddq_f32(lane, vdupq_n_f32(static_cast<float>(bin)));
+      const float32x4_t weight =
+          neon_exp_fast4(vsubq_f32(vld1q_f32(side_logits + bin), vdupq_n_f32(maximum)));
+      const float32x4_t index = vaddq_f32(lane, vdupq_n_f32(static_cast<float>(bin)));
       weighted_v = vmlaq_f32(weighted_v, index, weight);
       sum_v = vaddq_f32(sum_v, weight);
     }
@@ -381,8 +402,7 @@ static float candidate_iou(const candidate_t *a, const candidate_t *b) {
   return denom > 0.f ? inter / denom : 0.f;
 }
 
-static int nms_and_cap(candidate_t *candidates, int count, float iou_thr,
-                       int max_det) {
+static int nms_and_cap(candidate_t *candidates, int count, float iou_thr, int max_det) {
   const int nms_count = std::min(count, kMaxNmsCandidates);
   if (count > nms_count) {
     std::nth_element(candidates, candidates + nms_count, candidates + count,
@@ -414,10 +434,10 @@ static int nms_and_cap(candidate_t *candidates, int count, float iou_thr,
   return kept;
 }
 
-static int decode_candidates_from_seeds(
-    const rknn_output *outs, const rknn_tensor_attr *attrs, bool use_dfl,
-    const paddleyolo_rknn::postprocess::ClassSeed *class_seeds, int count,
-    float iou_thr, int max_det) {
+static int decode_candidates_from_seeds(const rknn_output *outs, const rknn_tensor_attr *attrs,
+                                        bool use_dfl,
+                                        const paddleyolo_rknn::postprocess::ClassSeed *class_seeds,
+                                        int count, bool apply_nms, float iou_thr, int max_det) {
   const int8_t *boxes = (const int8_t *)outs[0].buf;
   int anchors = attrs[1].dims[2];
   int box_ch = use_dfl ? attrs[0].dims[2] : 4;
@@ -428,8 +448,7 @@ static int decode_candidates_from_seeds(
   }
   int reg_max = box_ch / 4;
   candidate_t *candidates = ensure_candidates(count);
-  if (count > 0 &&
-      (boxes == nullptr || candidates == nullptr || class_seeds == nullptr)) {
+  if (count > 0 && (boxes == nullptr || candidates == nullptr || class_seeds == nullptr)) {
     g_last_candidates = 0;
     g_last_kept = 0;
     return -1;
@@ -441,17 +460,16 @@ static int decode_candidates_from_seeds(
     const auto &seed = class_seeds[index];
     if (seed.anchor != cached_anchor) {
       if (use_dfl) {
-        if (!decode_dfl_expectation4(boxes, &attrs[0], seed.anchor, anchors,
-                                     reg_max, transposed, cached_ltrb)) {
+        if (!decode_dfl_expectation4(boxes, &attrs[0], seed.anchor, anchors, reg_max, transposed,
+                                     cached_ltrb)) {
           g_last_candidates = 0;
           g_last_kept = 0;
           return -1;
         }
       } else {
         for (int side = 0; side < 4; ++side) {
-          cached_ltrb[side] =
-              dequant_i8_value(boxes[(size_t)side * anchors + seed.anchor],
-                               attrs[0].zp, attrs[0].scale);
+          cached_ltrb[side] = dequant_i8_value(boxes[(size_t)side * anchors + seed.anchor],
+                                               attrs[0].zp, attrs[0].scale);
         }
       }
       cached_anchor = seed.anchor;
@@ -468,15 +486,13 @@ static int decode_candidates_from_seeds(
     candidate->anchor = seed.anchor;
   }
   g_last_candidates = count;
-  g_last_kept =
-      count > 0 ? nms_and_cap(candidates, count, iou_thr, max_det) : 0;
+  g_last_nms_pairs = 0;
+  g_last_kept = apply_nms && count > 0 ? nms_and_cap(candidates, count, iou_thr, max_det) : count;
   return g_last_kept;
 }
 
-static int collect_candidates(const rknn_output *outs,
-                              const rknn_tensor_attr *attrs, bool use_dfl,
-                              bool use_score_sum, float conf_thr, float iou_thr,
-                              int max_det) {
+static int collect_candidates(const rknn_output *outs, const rknn_tensor_attr *attrs, bool use_dfl,
+                              bool use_score_sum, float conf_thr, float iou_thr, int max_det) {
   g_last_candidates = 0;
   g_last_kept = 0;
   g_last_nms_pairs = 0;
@@ -499,9 +515,8 @@ static int collect_candidates(const rknn_output *outs,
   }
   paddleyolo_rknn::postprocess::ClassSelectionStats selection_stats;
   const int count = paddleyolo_rknn::postprocess::SelectBestClassSeedsInt8(
-      scores, classes, anchors, {attrs[1].scale, attrs[1].zp}, conf_thr,
-      score_sum_ptr, class_seeds, static_cast<size_t>(max_candidates),
-      &selection_stats);
+      scores, classes, anchors, {attrs[1].scale, attrs[1].zp}, conf_thr, score_sum_ptr, class_seeds,
+      static_cast<size_t>(max_candidates), &selection_stats);
   if (count < 0) {
     fprintf(stderr, "class selector failed: %d\n", count);
     g_last_candidates = 0;
@@ -513,24 +528,67 @@ static int collect_candidates(const rknn_output *outs,
   g_last_class_anchors = selection_stats.class_anchors_scanned;
   g_last_class_values = static_cast<long>(selection_stats.class_values_scanned);
 
-  return decode_candidates_from_seeds(outs, attrs, use_dfl, class_seeds, count,
-                                      iou_thr, max_det);
+  return decode_candidates_from_seeds(outs, attrs, use_dfl, class_seeds, count, true, iou_thr,
+                                      max_det);
 }
 
-static cv::Rect make_proto_roi(const candidate_t &candidate, int proto_h,
-                               int proto_w) {
-  const float x_factor =
-      static_cast<float>(proto_w) / static_cast<float>(g_input_w);
-  const float y_factor =
-      static_cast<float>(proto_h) / static_cast<float>(g_input_h);
-  const float left =
-      std::clamp(candidate.x1, 0.0f, static_cast<float>(g_input_w));
-  const float top =
-      std::clamp(candidate.y1, 0.0f, static_cast<float>(g_input_h));
-  const float right =
-      std::clamp(candidate.x2, 0.0f, static_cast<float>(g_input_w));
-  const float bottom =
-      std::clamp(candidate.y2, 0.0f, static_cast<float>(g_input_h));
+/**
+ * @brief 执行 YOLO26 O2O 头的 exact TopK 并解码候选框。
+ * @param outs RKNN 逻辑输出，前两项为 box 与 cls logits。
+ * @param attrs 输出张量属性。
+ * @param conf_thr sigmoid 置信度阈值。
+ * @param max_det 两阶段 TopK 上限。
+ * @return 最终候选数；负值表示后处理失败。
+ */
+static int collect_nmsfree_candidates(const rknn_output *outs, const rknn_tensor_attr *attrs,
+                                      float conf_thr, int max_det) {
+  using paddleyolo_rknn::postprocess::NmsFreeTopKScratch;
+  using paddleyolo_rknn::postprocess::NmsFreeTopKStats;
+  using paddleyolo_rknn::postprocess::SelectNmsFreeTopKSeedsInt8;
+
+  g_last_candidates = 0;
+  g_last_kept = 0;
+  g_last_nms_pairs = 0;
+  g_last_sum_scanned = 0;
+  g_last_score_sum_applied = 0;
+  g_last_class_anchors = 0;
+  g_last_class_values = 0;
+  const int anchors = attrs[1].dims[2];
+  const int classes = attrs[1].dims[1];
+  const int capacity = std::min(max_det, anchors);
+  const int gathered_capacity = capacity * classes;
+  auto *class_seeds = ensure_class_seeds(capacity);
+  auto *anchor_max = ensure_i8(&g_anchor_max_logits, &g_lanchor_max_logits, anchors);
+  auto *anchor_ranking = ensure_ranked_values(&g_anchor_ranking, &g_lanchor_ranking, anchors);
+  auto *gathered_ranking =
+      ensure_ranked_values(&g_gathered_ranking, &g_lgathered_ranking, gathered_capacity);
+  if (class_seeds == nullptr || anchor_max == nullptr || anchor_ranking == nullptr ||
+      gathered_ranking == nullptr) {
+    return -1;
+  }
+
+  NmsFreeTopKStats stats{};
+  const int count = SelectNmsFreeTopKSeedsInt8(
+      static_cast<const int8_t *>(outs[1].buf), classes, anchors, {attrs[1].scale, attrs[1].zp},
+      conf_thr, max_det,
+      NmsFreeTopKScratch{anchor_max, static_cast<size_t>(anchors), anchor_ranking,
+                         static_cast<size_t>(anchors), gathered_ranking,
+                         static_cast<size_t>(gathered_capacity)},
+      class_seeds, static_cast<size_t>(capacity), &stats);
+  if (count < 0)
+    return count;
+  g_last_class_anchors = stats.selected_anchors;
+  g_last_class_values = stats.anchor_values_scanned + stats.gathered_values;
+  return decode_candidates_from_seeds(outs, attrs, false, class_seeds, count, false, 0.0F, max_det);
+}
+
+static cv::Rect make_proto_roi(const candidate_t &candidate, int proto_h, int proto_w) {
+  const float x_factor = static_cast<float>(proto_w) / static_cast<float>(g_input_w);
+  const float y_factor = static_cast<float>(proto_h) / static_cast<float>(g_input_h);
+  const float left = std::clamp(candidate.x1, 0.0f, static_cast<float>(g_input_w));
+  const float top = std::clamp(candidate.y1, 0.0f, static_cast<float>(g_input_h));
+  const float right = std::clamp(candidate.x2, 0.0f, static_cast<float>(g_input_w));
+  const float bottom = std::clamp(candidate.y2, 0.0f, static_cast<float>(g_input_h));
   const int x1 = std::clamp(static_cast<int>(left * x_factor), 0, proto_w);
   const int y1 = std::clamp(static_cast<int>(top * y_factor), 0, proto_h);
   const int x2 = std::clamp(static_cast<int>(right * x_factor), 0, proto_w);
@@ -539,27 +597,20 @@ static cv::Rect make_proto_roi(const candidate_t &candidate, int proto_h,
 }
 
 static cv::Size make_mask_output_size(const candidate_t &candidate) {
-  const float left =
-      std::clamp(candidate.x1, 0.0f, static_cast<float>(g_input_w - 1));
-  const float top =
-      std::clamp(candidate.y1, 0.0f, static_cast<float>(g_input_h - 1));
-  const float right =
-      std::clamp(candidate.x2, 0.0f, static_cast<float>(g_input_w - 1));
-  const float bottom =
-      std::clamp(candidate.y2, 0.0f, static_cast<float>(g_input_h - 1));
-  const float width_scale =
-      static_cast<float>(g_mask_output_width) / static_cast<float>(g_input_w);
+  const float left = std::clamp(candidate.x1, 0.0f, static_cast<float>(g_input_w - 1));
+  const float top = std::clamp(candidate.y1, 0.0f, static_cast<float>(g_input_h - 1));
+  const float right = std::clamp(candidate.x2, 0.0f, static_cast<float>(g_input_w - 1));
+  const float bottom = std::clamp(candidate.y2, 0.0f, static_cast<float>(g_input_h - 1));
+  const float width_scale = static_cast<float>(g_mask_output_width) / static_cast<float>(g_input_w);
   const float height_scale =
       static_cast<float>(g_mask_output_height) / static_cast<float>(g_input_h);
-  return cv::Size(
-      static_cast<int>(std::max(0.0f, right - left) * width_scale),
-      static_cast<int>(std::max(0.0f, bottom - top) * height_scale));
+  return cv::Size(static_cast<int>(std::max(0.0f, right - left) * width_scale),
+                  static_cast<int>(std::max(0.0f, bottom - top) * height_scale));
 }
 
 static bool mask_class_enabled(const int class_id) {
-  return g_mask_all_classes ||
-         std::find(g_mask_class_ids.begin(), g_mask_class_ids.end(),
-                   class_id) != g_mask_class_ids.end();
+  return g_mask_all_classes || std::find(g_mask_class_ids.begin(), g_mask_class_ids.end(),
+                                         class_id) != g_mask_class_ids.end();
 }
 
 static int collect_mask_candidate_indices(int *indices, const int capacity) {
@@ -573,8 +624,7 @@ static int collect_mask_candidate_indices(int *indices, const int capacity) {
   return count;
 }
 
-static void update_mask_stats(const cv::Mat &binary, uint64_t *hash,
-                              long *active) {
+static void update_mask_stats(const cv::Mat &binary, uint64_t *hash, long *active) {
   const size_t bytes = binary.total() * binary.elemSize();
   const uint8_t *data = binary.ptr<uint8_t>();
   for (size_t i = 0; i < bytes; ++i) {
@@ -586,10 +636,9 @@ static void update_mask_stats(const cv::Mat &binary, uint64_t *hash,
 }
 
 static bool run_segmentation_tail(
-    const rknn_output *outs, const rknn_tensor_attr *attrs,
-    const int *mask_candidate_indices, const int mask_candidate_count,
-    const paddleyolo_rknn::postprocess::Nc1hwc2Int8View *native_proto =
-        nullptr) {
+    const rknn_output *outs, const rknn_tensor_attr *attrs, const int *mask_candidate_indices,
+    const int mask_candidate_count,
+    const paddleyolo_rknn::postprocess::Nc1hwc2Int8View *native_proto = nullptr) {
   g_last_mask_pixels = 0;
   g_last_mask_active = 0;
   g_last_proto_roi_area = 0;
@@ -618,17 +667,14 @@ static bool run_segmentation_tail(
     const int anchor = candidate.anchor;
     for (int channel = 0; channel < nm; ++channel) {
       coeff[static_cast<size_t>(i) * nm + channel] = dequant_i8_value(
-          coeff_q[static_cast<size_t>(channel) * anchors + anchor], attrs[2].zp,
-          attrs[2].scale);
+          coeff_q[static_cast<size_t>(channel) * anchors + anchor], attrs[2].zp, attrs[2].scale);
     }
     g_last_proto_roi_area += make_proto_roi(candidate, proto_h, proto_w).area();
   }
 
   const auto decode_path =
-      paddleyolo_rknn::postprocess::SelectRoiMaskDecodePath(
-          g_last_proto_roi_area);
-  const bool use_int8_roi =
-      decode_path == paddleyolo_rknn::postprocess::RoiMaskDecodePath::kInt8;
+      paddleyolo_rknn::postprocess::SelectRoiMaskDecodePath(g_last_proto_roi_area);
+  const bool use_int8_roi = decode_path == paddleyolo_rknn::postprocess::RoiMaskDecodePath::kInt8;
   g_last_mask_mode = use_int8_roi ? "roi_tiled_i8" : "roi_tiled_f32";
   float *proto_f32 = nullptr;
   if (!use_int8_roi) {
@@ -651,36 +697,31 @@ static bool run_segmentation_tail(
       continue;
 
     float *roi_storage = ensure(&g_roi_storage, &g_lroi, roi.area());
-    float *resize_storage = ensure(&g_resize_storage, &g_lresize,
-                                   output_size.width * output_size.height);
-    uint8_t *binary_storage = ensure_u8(&g_binary_storage, &g_lbinary,
-                                        output_size.width * output_size.height);
-    if (roi_storage == nullptr || resize_storage == nullptr ||
-        binary_storage == nullptr) {
+    float *resize_storage =
+        ensure(&g_resize_storage, &g_lresize, output_size.width * output_size.height);
+    uint8_t *binary_storage =
+        ensure_u8(&g_binary_storage, &g_lbinary, output_size.width * output_size.height);
+    if (roi_storage == nullptr || resize_storage == nullptr || binary_storage == nullptr) {
       g_last_mask_mode = "allocation_failed";
       return false;
     }
     g_roi_logits = cv::Mat(roi.height, roi.width, CV_32F, roi_storage);
-    g_mask_resized =
-        cv::Mat(output_size.height, output_size.width, CV_32F, resize_storage);
-    g_mask_binary =
-        cv::Mat(output_size.height, output_size.width, CV_8U, binary_storage);
+    g_mask_resized = cv::Mat(output_size.height, output_size.width, CV_32F, resize_storage);
+    g_mask_binary = cv::Mat(output_size.height, output_size.width, CV_8U, binary_storage);
 
     const float *coeff_row = coeff + static_cast<size_t>(i) * nm;
     if (use_int8_roi) {
       paddleyolo_rknn::postprocess::ComputeRoiMaskInt8Nc1hwc2(
-          *native_proto, coeff_row, attrs[3].scale, attrs[3].zp, roi,
-          g_roi_logits,
+          *native_proto, coeff_row, attrs[3].scale, attrs[3].zp, roi, g_roi_logits,
           paddleyolo_rknn::postprocess::RoiMaskActivation::kSigmoid);
     } else {
       paddleyolo_rknn::postprocess::ComputeRoiMaskFloat32(
           proto_f32, nm, proto_h, proto_w, coeff_row, roi, g_roi_logits,
           paddleyolo_rknn::postprocess::RoiMaskActivation::kSigmoid);
     }
-    cv::resize(g_roi_logits, g_mask_resized, output_size, 0.0, 0.0,
-               cv::INTER_LINEAR);
-    paddleyolo_rknn::postprocess::AssignBinaryMaskFromProbabilityMat(
-        g_mask_resized, 127, g_mask_binary);
+    cv::resize(g_roi_logits, g_mask_resized, output_size, 0.0, 0.0, cv::INTER_LINEAR);
+    paddleyolo_rknn::postprocess::AssignBinaryMaskFromProbabilityMat(g_mask_resized, 127,
+                                                                     g_mask_binary);
     g_last_mask_pixels += static_cast<long>(g_mask_binary.total());
     if (g_mask_verify_enabled) {
       const double verify_start = now_ms();
@@ -694,8 +735,7 @@ static bool run_segmentation_tail(
   return true;
 }
 
-static double postproc_detect(const rknn_output *outs,
-                              const rknn_tensor_attr *attrs, bool use_dfl,
+static double postproc_detect(const rknn_output *outs, const rknn_tensor_attr *attrs, bool use_dfl,
                               float conf_thr, float iou_thr, int max_det) {
   double start = now_ms();
   collect_candidates(outs, attrs, use_dfl, false, conf_thr, iou_thr, max_det);
@@ -703,29 +743,24 @@ static double postproc_detect(const rknn_output *outs,
   return now_ms() - start;
 }
 
-static double postproc_predist(const rknn_output *outs,
-                               const rknn_tensor_attr *attrs, uint32_t n_out,
-                               float conf_thr, float iou_thr, int max_det) {
+static double postproc_predist(const rknn_output *outs, const rknn_tensor_attr *attrs,
+                               uint32_t n_out, float conf_thr, int max_det) {
   if (n_out != 2)
     return 0.0;
-  return postproc_detect(outs, attrs, false, conf_thr, iou_thr, max_det);
+  const double start = now_ms();
+  collect_nmsfree_candidates(outs, attrs, conf_thr, max_det);
+  g_sink += static_cast<float>(g_last_kept) * 1e-9F;
+  return now_ms() - start;
 }
 
-static double postproc_predfl(const rknn_output *outs,
-                              const rknn_tensor_attr *attrs, uint32_t n_out,
-                              float conf_thr, float iou_thr, int max_det) {
+static double postproc_predfl(const rknn_output *outs, const rknn_tensor_attr *attrs,
+                              uint32_t n_out, float conf_thr, float iou_thr, int max_det) {
   if (n_out != 2)
     return 0.0;
   return postproc_detect(outs, attrs, true, conf_thr, iou_thr, max_det);
 }
 
-typedef enum {
-  PP_NONE,
-  PP_PREDIST,
-  PP_PREDFL,
-  PP_SEG_PREDIST,
-  PP_SEG_PREDFL
-} pp_mode_t;
+typedef enum { PP_NONE, PP_PREDIST, PP_PREDFL, PP_SEG_PREDIST, PP_SEG_PREDFL } pp_mode_t;
 
 /**
  * @brief 校验后处理模式要求的输出数量。
@@ -734,18 +769,16 @@ typedef enum {
  * @return 契约满足时返回 0，否则返回 -1。
  */
 static int validate_output_count(pp_mode_t mode, uint32_t n_output) {
-  if ((mode == PP_SEG_PREDIST || mode == PP_SEG_PREDFL) && n_output != 5) {
-    fprintf(stderr, "seg postproc requires exactly 5 outputs, got %u\n",
-            n_output);
+  const uint32_t expected = mode == PP_SEG_PREDIST ? 4U : mode == PP_SEG_PREDFL ? 5U : 2U;
+  if (mode != PP_NONE && n_output != expected) {
+    fprintf(stderr, "postproc route requires exactly %u outputs, got %u\n", expected, n_output);
     return -1;
   }
   return 0;
 }
 
-static int validate_quantized_output(const rknn_tensor_attr *attr,
-                                     uint32_t index) {
-  if (attr->type != RKNN_TENSOR_INT8 ||
-      attr->qnt_type != RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC ||
+static int validate_quantized_output(const rknn_tensor_attr *attr, uint32_t index) {
+  if (attr->type != RKNN_TENSOR_INT8 || attr->qnt_type != RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC ||
       attr->scale <= 0.f) {
     fprintf(stderr,
             "output[%u] must be affine INT8 with positive scale, got type=%d "
@@ -754,9 +787,8 @@ static int validate_quantized_output(const rknn_tensor_attr *attr,
     return -1;
   }
   if (attr->fmt != RKNN_TENSOR_NCHW && attr->fmt != RKNN_TENSOR_UNDEFINED) {
-    fprintf(stderr,
-            "output[%u] must use logical NCHW/UNDEFINED layout, got fmt=%d\n",
-            index, attr->fmt);
+    fprintf(stderr, "output[%u] must use logical NCHW/UNDEFINED layout, got fmt=%d\n", index,
+            attr->fmt);
     return -1;
   }
   return 0;
@@ -766,11 +798,9 @@ static int validate_output_contract(pp_mode_t mode, uint32_t n_output,
                                     const rknn_tensor_attr *attrs) {
   if (mode == PP_NONE)
     return 0;
-  uint32_t expected =
-      (mode == PP_SEG_PREDIST || mode == PP_SEG_PREDFL) ? 5u : 2u;
+  const uint32_t expected = mode == PP_SEG_PREDIST ? 4U : mode == PP_SEG_PREDFL ? 5U : 2U;
   if (n_output != expected) {
-    fprintf(stderr, "postproc route requires exactly %u outputs, got %u\n",
-            expected, n_output);
+    fprintf(stderr, "postproc route requires exactly %u outputs, got %u\n", expected, n_output);
     return -1;
   }
   for (uint32_t i = 0; i < n_output; i++) {
@@ -790,9 +820,8 @@ static int validate_output_contract(pp_mode_t mode, uint32_t n_output,
     expected_anchors += (g_input_h / strides[i]) * (g_input_w / strides[i]);
   }
   if (anchors != expected_anchors) {
-    fprintf(stderr,
-            "anchor count mismatch: output=%d expected=%d for input=%dx%d\n",
-            anchors, expected_anchors, g_input_w, g_input_h);
+    fprintf(stderr, "anchor count mismatch: output=%d expected=%d for input=%dx%d\n", anchors,
+            expected_anchors, g_input_w, g_input_h);
     return -1;
   }
 
@@ -802,10 +831,9 @@ static int validate_output_contract(pp_mode_t mode, uint32_t n_output,
     return -1;
   }
   if (dfl) {
-    bool transposed = attrs[0].dims[1] == (uint32_t)anchors &&
-                      attrs[0].dims[2] > 4 && attrs[0].dims[2] % 4 == 0;
-    bool channel_first = mode == PP_PREDFL &&
-                         attrs[0].dims[2] == (uint32_t)anchors &&
+    bool transposed =
+        attrs[0].dims[1] == (uint32_t)anchors && attrs[0].dims[2] > 4 && attrs[0].dims[2] % 4 == 0;
+    bool channel_first = mode == PP_PREDFL && attrs[0].dims[2] == (uint32_t)anchors &&
                          attrs[0].dims[1] > 4 && attrs[0].dims[1] % 4 == 0;
     if (!transposed && !channel_first) {
       fprintf(stderr, "DFL output[0] must be [1,A,4*reg_max]%s\n",
@@ -817,23 +845,24 @@ static int validate_output_contract(pp_mode_t mode, uint32_t n_output,
     return -1;
   }
 
-  if (expected == 5u) {
+  if (mode == PP_SEG_PREDIST || mode == PP_SEG_PREDFL) {
     if (attrs[2].n_dims != 3 || attrs[2].dims[0] != 1 || attrs[2].dims[1] < 1 ||
         attrs[2].dims[2] != (uint32_t)anchors) {
       fprintf(stderr, "output[2] must be mask coeff [1,nm,A]\n");
       return -1;
     }
     int nm = attrs[2].dims[1];
-    if (attrs[3].n_dims != 4 || attrs[3].dims[0] != 1 ||
-        attrs[3].dims[1] != (uint32_t)nm || attrs[3].dims[2] < 1 ||
-        attrs[3].dims[3] < 1) {
+    if (attrs[3].n_dims != 4 || attrs[3].dims[0] != 1 || attrs[3].dims[1] != (uint32_t)nm ||
+        attrs[3].dims[2] < 1 || attrs[3].dims[3] < 1) {
       fprintf(stderr, "output[3] must be proto [1,nm,H,W] with matching nm\n");
       return -1;
     }
-    if (attrs[4].n_dims != 3 || attrs[4].dims[0] != 1 ||
-        attrs[4].dims[1] != 1 || attrs[4].dims[2] != (uint32_t)anchors) {
-      fprintf(stderr, "output[4] must be score_sum [1,1,A]\n");
-      return -1;
+    if (mode == PP_SEG_PREDFL) {
+      if (attrs[4].n_dims != 3 || attrs[4].dims[0] != 1 || attrs[4].dims[1] != 1 ||
+          attrs[4].dims[2] != (uint32_t)anchors) {
+        fprintf(stderr, "output[4] must be score_sum [1,1,A]\n");
+        return -1;
+      }
     }
   }
   return 0;
@@ -876,8 +905,7 @@ static bool parse_core(const char *s, int *mask) {
 }
 
 static const char *normalize_sram_mode(const char *s) {
-  if (!s || !strcmp(s, "off") || !strcmp(s, "private") ||
-      !strcmp(s, "shared")) {
+  if (!s || !strcmp(s, "off") || !strcmp(s, "private") || !strcmp(s, "shared")) {
     return s ? s : "off";
   }
   return "off";
@@ -968,23 +996,19 @@ typedef struct {
  * @param conf_thr 置信度阈值。
  * @return 后处理耗时，单位 ms。
  */
-static double run_postproc(pp_mode_t pp, const rknn_output *outs,
-                           const rknn_tensor_attr *out_attrs, uint32_t n_output,
-                           float conf_thr, float iou_thr, int max_det) {
+static double run_postproc(pp_mode_t pp, const rknn_output *outs, const rknn_tensor_attr *out_attrs,
+                           uint32_t n_output, float conf_thr, float iou_thr, int max_det) {
   switch (pp) {
-  case PP_PREDIST:
-    return postproc_predist(outs, out_attrs, n_output, conf_thr, iou_thr,
-                            max_det);
-  case PP_PREDFL:
-    return postproc_predfl(outs, out_attrs, n_output, conf_thr, iou_thr,
-                           max_det);
-  default:
-    return 0.0;
+    case PP_PREDIST:
+      return postproc_predist(outs, out_attrs, n_output, conf_thr, max_det);
+    case PP_PREDFL:
+      return postproc_predfl(outs, out_attrs, n_output, conf_thr, iou_thr, max_det);
+    default:
+      return 0.0;
   }
 }
 
-static void update_full_io_stats(
-    const paddleyolo_rknn::postprocess::FiveOutputRuntime &runtime) {
+static void update_full_io_stats(const paddleyolo_rknn::postprocess::FullIoRuntime &runtime) {
   const auto &stats = runtime.Stats();
   g_last_sync_bytes = stats.native_bytes;
   g_last_ready_mask = stats.ready_mask;
@@ -996,14 +1020,13 @@ static void mark_staged_failure(const char *outcome) {
   g_last_staged_failed = true;
 }
 
-static double run_staged_seg_postproc(
-    paddleyolo_rknn::postprocess::FiveOutputRuntime *runtime,
-    const rknn_tensor_attr *attrs, bool use_dfl, float conf_thr, float iou_thr,
-    int max_det) {
+static double run_staged_seg_postproc(paddleyolo_rknn::postprocess::FullIoRuntime *runtime,
+                                      const rknn_tensor_attr *attrs, bool use_dfl, float conf_thr,
+                                      float iou_thr, int max_det) {
   using paddleyolo_rknn::postprocess::ClassifyAnchorsBestClassInt8;
   using paddleyolo_rknn::postprocess::ClassSelectionStats;
   using paddleyolo_rknn::postprocess::CollectScoreSumSurvivorsInt8;
-  using paddleyolo_rknn::postprocess::FiveOutputTensor;
+  using paddleyolo_rknn::postprocess::FullIoTensor;
   using paddleyolo_rknn::postprocess::kScoreSumPrescreenUnavailable;
   using paddleyolo_rknn::postprocess::ScoreSumInt8View;
 
@@ -1027,87 +1050,98 @@ static double run_staged_seg_postproc(
   rknn_output *outputs = runtime->Outputs();
   const int anchors = attrs[1].dims[2];
   const int classes = attrs[1].dims[1];
-  const int max_candidates = anchors;
-  auto *class_seeds = ensure_class_seeds(max_candidates);
-  int *survivors =
-      ensure_int(&g_score_sum_survivors, &g_lscore_sum_survivors, anchors);
-  if (class_seeds == nullptr || survivors == nullptr) {
-    mark_staged_failure("allocation_failed");
-    update_full_io_stats(*runtime);
-    return now_ms() - start;
-  }
-
-  int survivor_count = kScoreSumPrescreenUnavailable;
-  if (g_score_sum_enabled) {
-    if (runtime->Prepare(FiveOutputTensor::kScoreSum) != 0) {
-      mark_staged_failure("score_sum_sync_failed");
-      update_full_io_stats(*runtime);
-      return now_ms() - start;
-    }
-    ScoreSumInt8View score_sum{static_cast<const int8_t *>(outputs[4].buf),
-                               {attrs[4].scale, attrs[4].zp}};
-    survivor_count = CollectScoreSumSurvivorsInt8(
-        score_sum, anchors, conf_thr, survivors, static_cast<size_t>(anchors));
-    if (survivor_count < 0 && survivor_count != kScoreSumPrescreenUnavailable) {
-      mark_staged_failure("score_sum_selection_failed");
-      update_full_io_stats(*runtime);
-      return std::max(0.0, now_ms() - start - g_last_sync_ms);
-    }
-    if (survivor_count >= 0) {
-      g_last_score_sum_applied = 1;
-      g_last_sum_scanned = anchors;
-      if (survivor_count == 0) {
-        g_last_fetch_outcome = "no_score_sum_survivors";
-        update_full_io_stats(*runtime);
-        return std::max(0.0, now_ms() - start - g_last_sync_ms);
-      }
-    }
-  }
-
-  if (runtime->Prepare(FiveOutputTensor::kClass) != 0) {
+  if (runtime->Prepare(FullIoTensor::kClass) != 0) {
     mark_staged_failure("class_sync_failed");
     update_full_io_stats(*runtime);
     return now_ms() - start;
   }
-  ClassSelectionStats selection_stats{};
-  int seed_count = 0;
-  if (survivor_count >= 0) {
-    seed_count = ClassifyAnchorsBestClassInt8(
-        static_cast<const int8_t *>(outputs[1].buf), classes, anchors,
-        {attrs[1].scale, attrs[1].zp}, conf_thr, survivors,
-        static_cast<size_t>(survivor_count), class_seeds,
-        static_cast<size_t>(max_candidates), &selection_stats);
-    selection_stats.used_score_sum = true;
-    selection_stats.score_sum_scanned = anchors;
+  if (!use_dfl) {
+    if (runtime->Prepare(FullIoTensor::kBox) != 0) {
+      mark_staged_failure("box_sync_failed");
+      update_full_io_stats(*runtime);
+      return now_ms() - start;
+    }
+    if (collect_nmsfree_candidates(outputs, attrs, conf_thr, max_det) < 0) {
+      mark_staged_failure("nmsfree_topk_failed");
+      update_full_io_stats(*runtime);
+      return std::max(0.0, now_ms() - start - g_last_sync_ms);
+    }
   } else {
-    seed_count = paddleyolo_rknn::postprocess::SelectBestClassSeedsInt8(
-        static_cast<const int8_t *>(outputs[1].buf), classes, anchors,
-        {attrs[1].scale, attrs[1].zp}, conf_thr, nullptr, class_seeds,
-        static_cast<size_t>(max_candidates), &selection_stats);
-  }
-  if (seed_count < 0) {
-    mark_staged_failure("classification_failed");
-    update_full_io_stats(*runtime);
-    return std::max(0.0, now_ms() - start - g_last_sync_ms);
-  }
-  g_last_class_anchors = selection_stats.class_anchors_scanned;
-  g_last_class_values = static_cast<long>(selection_stats.class_values_scanned);
-  if (seed_count == 0) {
-    g_last_fetch_outcome = "no_class_seeds";
-    update_full_io_stats(*runtime);
-    return std::max(0.0, now_ms() - start - g_last_sync_ms);
-  }
+    const int max_candidates = anchors;
+    auto *class_seeds = ensure_class_seeds(max_candidates);
+    int *survivors = ensure_int(&g_score_sum_survivors, &g_lscore_sum_survivors, anchors);
+    if (class_seeds == nullptr || survivors == nullptr) {
+      mark_staged_failure("allocation_failed");
+      update_full_io_stats(*runtime);
+      return now_ms() - start;
+    }
 
-  if (runtime->Prepare(FiveOutputTensor::kBox) != 0) {
-    mark_staged_failure("box_sync_failed");
-    update_full_io_stats(*runtime);
-    return now_ms() - start;
-  }
-  if (decode_candidates_from_seeds(outputs, attrs, use_dfl, class_seeds,
-                                   seed_count, iou_thr, max_det) < 0) {
-    mark_staged_failure("candidate_decode_failed");
-    update_full_io_stats(*runtime);
-    return std::max(0.0, now_ms() - start - g_last_sync_ms);
+    int survivor_count = kScoreSumPrescreenUnavailable;
+    if (g_score_sum_enabled) {
+      if (runtime->Prepare(FullIoTensor::kScoreSum) != 0) {
+        mark_staged_failure("score_sum_sync_failed");
+        update_full_io_stats(*runtime);
+        return now_ms() - start;
+      }
+      ScoreSumInt8View score_sum{static_cast<const int8_t *>(outputs[4].buf),
+                                 {attrs[4].scale, attrs[4].zp}};
+      survivor_count = CollectScoreSumSurvivorsInt8(score_sum, anchors, conf_thr, survivors,
+                                                    static_cast<size_t>(anchors));
+      if (survivor_count < 0 && survivor_count != kScoreSumPrescreenUnavailable) {
+        mark_staged_failure("score_sum_selection_failed");
+        update_full_io_stats(*runtime);
+        return std::max(0.0, now_ms() - start - g_last_sync_ms);
+      }
+      if (survivor_count >= 0) {
+        g_last_score_sum_applied = 1;
+        g_last_sum_scanned = anchors;
+        if (survivor_count == 0) {
+          g_last_fetch_outcome = "no_score_sum_survivors";
+          update_full_io_stats(*runtime);
+          return std::max(0.0, now_ms() - start - g_last_sync_ms);
+        }
+      }
+    }
+
+    ClassSelectionStats selection_stats{};
+    int seed_count = 0;
+    if (survivor_count >= 0) {
+      seed_count = ClassifyAnchorsBestClassInt8(
+          static_cast<const int8_t *>(outputs[1].buf), classes, anchors,
+          {attrs[1].scale, attrs[1].zp}, conf_thr, survivors, static_cast<size_t>(survivor_count),
+          class_seeds, static_cast<size_t>(max_candidates), &selection_stats);
+      selection_stats.used_score_sum = true;
+      selection_stats.score_sum_scanned = anchors;
+    } else {
+      seed_count = paddleyolo_rknn::postprocess::SelectBestClassSeedsInt8(
+          static_cast<const int8_t *>(outputs[1].buf), classes, anchors,
+          {attrs[1].scale, attrs[1].zp}, conf_thr, nullptr, class_seeds,
+          static_cast<size_t>(max_candidates), &selection_stats);
+    }
+    if (seed_count < 0) {
+      mark_staged_failure("classification_failed");
+      update_full_io_stats(*runtime);
+      return std::max(0.0, now_ms() - start - g_last_sync_ms);
+    }
+    g_last_class_anchors = selection_stats.class_anchors_scanned;
+    g_last_class_values = static_cast<long>(selection_stats.class_values_scanned);
+    if (seed_count == 0) {
+      g_last_fetch_outcome = "no_class_seeds";
+      update_full_io_stats(*runtime);
+      return std::max(0.0, now_ms() - start - g_last_sync_ms);
+    }
+
+    if (runtime->Prepare(FullIoTensor::kBox) != 0) {
+      mark_staged_failure("box_sync_failed");
+      update_full_io_stats(*runtime);
+      return now_ms() - start;
+    }
+    if (decode_candidates_from_seeds(outputs, attrs, true, class_seeds, seed_count, true, iou_thr,
+                                     max_det) < 0) {
+      mark_staged_failure("candidate_decode_failed");
+      update_full_io_stats(*runtime);
+      return std::max(0.0, now_ms() - start - g_last_sync_ms);
+    }
   }
   if (g_last_kept <= 0) {
     g_last_fetch_outcome = "no_boxes";
@@ -1115,8 +1149,8 @@ static double run_staged_seg_postproc(
     return std::max(0.0, now_ms() - start - g_last_sync_ms);
   }
 
-  int *mask_candidate_indices = ensure_int(
-      &g_mask_candidate_indices, &g_lmask_candidate_indices, g_last_kept);
+  int *mask_candidate_indices =
+      ensure_int(&g_mask_candidate_indices, &g_lmask_candidate_indices, g_last_kept);
   const int mask_candidate_count =
       collect_mask_candidate_indices(mask_candidate_indices, g_last_kept);
   if (mask_candidate_count < 0) {
@@ -1130,25 +1164,26 @@ static double run_staged_seg_postproc(
     return std::max(0.0, now_ms() - start - g_last_sync_ms);
   }
 
-  if (runtime->Prepare(FiveOutputTensor::kMaskCoeff) != 0 ||
-      runtime->Prepare(FiveOutputTensor::kProto) != 0) {
+  if (runtime->Prepare(FullIoTensor::kMaskCoeff) != 0 ||
+      runtime->Prepare(FullIoTensor::kProto) != 0) {
     mark_staged_failure("mask_sync_failed");
     update_full_io_stats(*runtime);
     return now_ms() - start;
   }
-  if (!run_segmentation_tail(outputs, attrs, mask_candidate_indices,
-                             mask_candidate_count, &runtime->ProtoView())) {
+  if (!run_segmentation_tail(outputs, attrs, mask_candidate_indices, mask_candidate_count,
+                             &runtime->ProtoView())) {
     mark_staged_failure("mask_decode_failed");
     update_full_io_stats(*runtime);
     return std::max(0.0, now_ms() - start - g_last_sync_ms);
   }
   g_last_fetch_outcome = "masks_required";
   update_full_io_stats(*runtime);
-  return std::max(0.0,
-                  now_ms() - start - g_last_sync_ms - g_last_mask_verify_ms);
+  return std::max(0.0, now_ms() - start - g_last_sync_ms - g_last_mask_verify_ms);
 }
 
-static bool staged_postproc_failed(void) { return g_last_staged_failed; }
+static bool staged_postproc_failed(void) {
+  return g_last_staged_failed;
+}
 
 static bool parse_mask_class_ids(const char *spec) {
   if (spec == nullptr || *spec == '\0')
@@ -1163,8 +1198,7 @@ static bool parse_mask_class_ids(const char *spec) {
   while (*cursor != '\0') {
     char *end = nullptr;
     const long value = strtol(cursor, &end, 10);
-    if (end == cursor || value < 0 || value > INT_MAX ||
-        (*end != '\0' && *end != ',')) {
+    if (end == cursor || value < 0 || value > INT_MAX || (*end != '\0' && *end != ',')) {
       return false;
     }
     const int class_id = static_cast<int>(value);
@@ -1192,8 +1226,8 @@ static bool parse_mask_output_size(const char *spec) {
     return false;
   char *height_end = nullptr;
   const long height = strtol(width_end + 1, &height_end, 10);
-  if (height_end == width_end + 1 || *height_end != '\0' || width <= 0 ||
-      height <= 0 || width > INT_MAX || height > INT_MAX) {
+  if (height_end == width_end + 1 || *height_end != '\0' || width <= 0 || height <= 0 ||
+      width > INT_MAX || height > INT_MAX) {
     return false;
   }
   g_mask_output_width = static_cast<int>(width);
@@ -1214,8 +1248,8 @@ static int parse_core_map(const char *spec, int *masks, int max_masks) {
 
   char tmp[128];
   const size_t spec_length = strlen(spec);
-  if (spec_length >= sizeof(tmp) || spec[0] == ',' ||
-      spec[spec_length - 1] == ',' || strstr(spec, ",,") != nullptr)
+  if (spec_length >= sizeof(tmp) || spec[0] == ',' || spec[spec_length - 1] == ',' ||
+      strstr(spec, ",,") != nullptr)
     return -1;
   strncpy(tmp, spec, sizeof(tmp) - 1);
   tmp[sizeof(tmp) - 1] = '\0';
@@ -1250,13 +1284,11 @@ static int parse_core_map(const char *spec, int *masks, int max_masks) {
  * @param inp 输出 RKNN 输入描述。
  * @return 0 表示成功；负数表示 RKNN 或内存错误。
  */
-static int
-setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
-              int core_mask, uint32_t init_flags, rknn_context share_ctx,
-              pp_mode_t pp, rknn_input_output_num *io,
-              rknn_tensor_attr *in_attrs, rknn_tensor_attr *out_attrs,
-              void **dummy, size_t *in_size, rknn_input *inp,
-              paddleyolo_rknn::postprocess::FiveOutputRuntime *full_io) {
+static int setup_context(rknn_context *ctx, const void *model_buf, size_t model_size, int core_mask,
+                         uint32_t init_flags, rknn_context share_ctx, pp_mode_t pp,
+                         rknn_input_output_num *io, rknn_tensor_attr *in_attrs,
+                         rknn_tensor_attr *out_attrs, void **dummy, size_t *in_size,
+                         rknn_input *inp, paddleyolo_rknn::postprocess::FullIoRuntime *full_io) {
   void *model_copy = malloc(model_size);
   if (!model_copy) {
     fprintf(stderr, "malloc model copy failed\n");
@@ -1266,8 +1298,7 @@ setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
   rknn_init_extend init_extend;
   memset(&init_extend, 0, sizeof(init_extend));
   init_extend.ctx = share_ctx;
-  int ret = rknn_init(ctx, model_copy, model_size, init_flags,
-                      init_flags ? &init_extend : NULL);
+  int ret = rknn_init(ctx, model_copy, model_size, init_flags, init_flags ? &init_extend : NULL);
   free(model_copy);
   if (ret < 0) {
     fprintf(stderr, "rknn_init: %d\n", ret);
@@ -1286,8 +1317,7 @@ setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
     return ret;
   }
   if (io->n_input < 1 || io->n_input > MAX_IO || io->n_output > MAX_IO) {
-    fprintf(stderr, "unsupported io count: input=%u output=%u\n", io->n_input,
-            io->n_output);
+    fprintf(stderr, "unsupported io count: input=%u output=%u\n", io->n_input, io->n_output);
     return -1;
   }
   if (validate_output_count(pp, io->n_output) < 0) {
@@ -1297,8 +1327,7 @@ setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
   for (uint32_t i = 0; i < io->n_input; i++) {
     memset(&in_attrs[i], 0, sizeof(in_attrs[i]));
     in_attrs[i].index = i;
-    ret = rknn_query(*ctx, RKNN_QUERY_INPUT_ATTR, &in_attrs[i],
-                     sizeof(in_attrs[i]));
+    ret = rknn_query(*ctx, RKNN_QUERY_INPUT_ATTR, &in_attrs[i], sizeof(in_attrs[i]));
     if (ret < 0) {
       fprintf(stderr, "RKNN_QUERY_INPUT_ATTR[%u]: %d\n", i, ret);
       return ret;
@@ -1307,8 +1336,7 @@ setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
   for (uint32_t i = 0; i < io->n_output; i++) {
     memset(&out_attrs[i], 0, sizeof(out_attrs[i]));
     out_attrs[i].index = i;
-    ret = rknn_query(*ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attrs[i],
-                     sizeof(out_attrs[i]));
+    ret = rknn_query(*ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attrs[i], sizeof(out_attrs[i]));
     if (ret < 0) {
       fprintf(stderr, "RKNN_QUERY_OUTPUT_ATTR[%u]: %d\n", i, ret);
       return ret;
@@ -1350,10 +1378,9 @@ setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
   inp[0].type = RKNN_TENSOR_UINT8;
   inp[0].fmt = RKNN_TENSOR_NHWC;
   if (pp == PP_SEG_PREDIST || pp == PP_SEG_PREDFL) {
-    if (full_io == nullptr ||
-        !full_io->Initialize(*ctx, in_attrs[0], out_attrs, io->n_output) ||
+    if (full_io == nullptr || !full_io->Initialize(*ctx, in_attrs[0], out_attrs, io->n_output) ||
         !full_io->SetInput(*dummy, *in_size)) {
-      fprintf(stderr, "five-output full-IO initialization failed\n");
+      fprintf(stderr, "segmentation full-IO initialization failed\n");
       return -1;
     }
   }
@@ -1372,20 +1399,18 @@ setup_context(rknn_context *ctx, const void *model_buf, size_t model_size,
  * @param pp_ms 输出后处理耗时，单位 ms。
  * @return 0 表示成功；负数表示 RKNN 错误。
  */
-static int
-run_one_iteration(rknn_context ctx, const rknn_input *inp,
-                  const rknn_input_output_num *io,
-                  const rknn_tensor_attr *out_attrs, pp_mode_t pp,
-                  float conf_thr, float iou_thr, int max_det,
-                  paddleyolo_rknn::postprocess::FiveOutputRuntime *full_io,
-                  double *e2e_ms, double *pp_ms) {
+static int run_one_iteration(rknn_context ctx, const rknn_input *inp,
+                             const rknn_input_output_num *io, const rknn_tensor_attr *out_attrs,
+                             pp_mode_t pp, float conf_thr, float iou_thr, int max_det,
+                             paddleyolo_rknn::postprocess::FullIoRuntime *full_io, double *e2e_ms,
+                             double *pp_ms) {
   if (full_io != nullptr && full_io->IsInitialized()) {
     const double start = now_ms();
     int ret = full_io->Run();
     if (ret != 0)
       return ret;
-    const double post_ms = run_staged_seg_postproc(
-        full_io, out_attrs, pp == PP_SEG_PREDFL, conf_thr, iou_thr, max_det);
+    const double post_ms = run_staged_seg_postproc(full_io, out_attrs, pp == PP_SEG_PREDFL,
+                                                   conf_thr, iou_thr, max_det);
     if (staged_postproc_failed())
       return -1;
     if (pp_ms)
@@ -1410,8 +1435,7 @@ run_one_iteration(rknn_context ctx, const rknn_input *inp,
   ret = rknn_outputs_get(ctx, io->n_output, outs, NULL);
   if (ret < 0)
     return ret;
-  double post_ms = run_postproc(pp, outs, out_attrs, io->n_output, conf_thr,
-                                iou_thr, max_det);
+  double post_ms = run_postproc(pp, outs, out_attrs, io->n_output, conf_thr, iou_thr, max_det);
   ret = rknn_outputs_release(ctx, io->n_output, outs);
   double t2 = now_ms();
   if (ret < 0)
@@ -1440,7 +1464,7 @@ static void *fps_worker_main(void *opaque) {
   void *dummy = NULL;
   size_t in_size = 0;
   rknn_input inp[1];
-  paddleyolo_rknn::postprocess::FiveOutputRuntime full_io;
+  paddleyolo_rknn::postprocess::FullIoRuntime full_io;
 
   if (arg->shared_sram_mode) {
     if (arg->worker_id == 0) {
@@ -1464,9 +1488,8 @@ static void *fps_worker_main(void *opaque) {
   }
 
   arg->ret =
-      setup_context(&ctx, arg->model_buf, arg->model_size, arg->core_mask,
-                    init_flags, share_ctx, arg->pp, &io, in_attrs, out_attrs,
-                    &dummy, &in_size, inp, &full_io);
+      setup_context(&ctx, arg->model_buf, arg->model_size, arg->core_mask, init_flags, share_ctx,
+                    arg->pp, &io, in_attrs, out_attrs, &dummy, &in_size, inp, &full_io);
   if (arg->shared_sram_mode && arg->worker_id == 0) {
     fps_shared_state_t *state = arg->share_state;
     pthread_mutex_lock(&state->mutex);
@@ -1484,9 +1507,8 @@ static void *fps_worker_main(void *opaque) {
 
   for (int w = 0; w < arg->warmup; w++) {
     double e2e_ms = 0.0, pp_ms = 0.0;
-    arg->ret = run_one_iteration(ctx, inp, &io, out_attrs, arg->pp,
-                                 arg->conf_thr, arg->iou_thr, arg->max_det,
-                                 &full_io, &e2e_ms, &pp_ms);
+    arg->ret = run_one_iteration(ctx, inp, &io, out_attrs, arg->pp, arg->conf_thr, arg->iou_thr,
+                                 arg->max_det, &full_io, &e2e_ms, &pp_ms);
     if (arg->ret < 0) {
       pthread_barrier_wait(arg->ready_barrier);
       pthread_barrier_wait(arg->start_barrier);
@@ -1500,9 +1522,8 @@ static void *fps_worker_main(void *opaque) {
   arg->min_e2e_ms = DBL_MAX;
   while (now_ms() < *arg->end_ms) {
     double e2e_ms = 0.0, pp_ms = 0.0;
-    arg->ret = run_one_iteration(ctx, inp, &io, out_attrs, arg->pp,
-                                 arg->conf_thr, arg->iou_thr, arg->max_det,
-                                 &full_io, &e2e_ms, &pp_ms);
+    arg->ret = run_one_iteration(ctx, inp, &io, out_attrs, arg->pp, arg->conf_thr, arg->iou_thr,
+                                 arg->max_det, &full_io, &e2e_ms, &pp_ms);
     if (arg->ret < 0)
       goto done;
     arg->frames++;
@@ -1561,12 +1582,10 @@ done:
  * @param fps_seconds 计时秒数。
  * @return 0 表示成功；非 0 表示参数或 RKNN 错误。
  */
-static int run_fps_mode(const char *model_path, const void *model_buf,
-                        size_t model_size, const char *json_out,
-                        const char *pp_str, pp_mode_t pp, float conf_thr,
-                        float iou_thr, int max_det, int warmup,
-                        const char *core_str, const char *fps_core_map,
-                        const char *sram_str, uint32_t init_flags,
+static int run_fps_mode(const char *model_path, const void *model_buf, size_t model_size,
+                        const char *json_out, const char *pp_str, pp_mode_t pp, float conf_thr,
+                        float iou_thr, int max_det, int warmup, const char *core_str,
+                        const char *fps_core_map, const char *sram_str, uint32_t init_flags,
                         int fps_workers, double fps_seconds) {
   if (fps_workers <= 0 || fps_workers > MAX_FPS_WORKERS) {
     fprintf(stderr, "--fps-workers must be in [1,%d]\n", MAX_FPS_WORKERS);
@@ -1580,8 +1599,7 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
   int mapped_cores[MAX_FPS_WORKERS];
   int map_count = parse_core_map(fps_core_map, mapped_cores, MAX_FPS_WORKERS);
   if (map_count < 0) {
-    fprintf(stderr, "invalid --fps-core-map value: %s\n",
-            fps_core_map ? fps_core_map : "");
+    fprintf(stderr, "invalid --fps-core-map value: %s\n", fps_core_map ? fps_core_map : "");
     return 2;
   }
   int default_core = RKNN_NPU_CORE_AUTO;
@@ -1597,8 +1615,7 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
   pthread_barrier_t release_barrier;
   fps_shared_state_t share_state;
   double end_ms = 0.0;
-  bool shared_sram_mode =
-      is_shared_sram_mode(sram_str) && flags_request_shared_sram(init_flags);
+  bool shared_sram_mode = is_shared_sram_mode(sram_str) && flags_request_shared_sram(init_flags);
 
   pthread_barrier_init(&ready_barrier, NULL, (unsigned)fps_workers + 1);
   pthread_barrier_init(&start_barrier, NULL, (unsigned)fps_workers + 1);
@@ -1615,8 +1632,7 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
     args[i].model_buf = model_buf;
     args[i].model_size = model_size;
     args[i].worker_id = i;
-    args[i].core_mask =
-        map_count > 0 ? mapped_cores[i % map_count] : default_core;
+    args[i].core_mask = map_count > 0 ? mapped_cores[i % map_count] : default_core;
     args[i].init_flags = init_flags;
     args[i].shared_sram_mode = shared_sram_mode;
     args[i].share_state = shared_sram_mode ? &share_state : NULL;
@@ -1683,23 +1699,17 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
 
   double measured_s = (finish_ms - start_ms) / 1000.0;
   double fps = measured_s > 0.0 ? (double)total_frames / measured_s : 0.0;
-  double avg_e2e_ms =
-      total_frames > 0 ? total_e2e_ms / (double)total_frames : 0.0;
-  double avg_pp_ms =
-      total_frames > 0 ? total_pp_ms / (double)total_frames : 0.0;
-  double avg_sync_ms =
-      total_frames > 0 ? total_sync_ms / (double)total_frames : 0.0;
-  double avg_mask_verify_ms =
-      total_frames > 0 ? total_mask_verify_ms / (double)total_frames : 0.0;
-  double avg_sync_bytes =
-      total_frames > 0 ? (double)total_sync_bytes / (double)total_frames : 0.0;
+  double avg_e2e_ms = total_frames > 0 ? total_e2e_ms / (double)total_frames : 0.0;
+  double avg_pp_ms = total_frames > 0 ? total_pp_ms / (double)total_frames : 0.0;
+  double avg_sync_ms = total_frames > 0 ? total_sync_ms / (double)total_frames : 0.0;
+  double avg_mask_verify_ms = total_frames > 0 ? total_mask_verify_ms / (double)total_frames : 0.0;
+  double avg_sync_bytes = total_frames > 0 ? (double)total_sync_bytes / (double)total_frames : 0.0;
   if (min_e2e_ms == DBL_MAX)
     min_e2e_ms = 0.0;
 
   printf("\n=== bench_rknn_perf offline FPS ===\n");
   printf("model:       %s\n", model_path);
-  printf("workers:     %d   seconds: %.3f   warmup: %d\n", fps_workers,
-         fps_seconds, warmup);
+  printf("workers:     %d   seconds: %.3f   warmup: %d\n", fps_workers, fps_seconds, warmup);
   printf("core:        %s   fps_core_map: %s   neon: %d\n", core_str,
          fps_core_map && *fps_core_map ? fps_core_map : "(none)", HAVE_NEON);
   printf("sram:        %s   init_flags: 0x%08x\n", sram_str, init_flags);
@@ -1710,23 +1720,19 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
   printf("mask_size:    %dx%d\n", g_mask_output_width, g_mask_output_height);
   printf("frames:      %ld\n", total_frames);
   printf("offline_fps: %.2f\n", fps);
-  printf("e2e_ms:      avg=%.3f  min=%.3f  max=%.3f\n", avg_e2e_ms, min_e2e_ms,
-         max_e2e_ms);
+  printf("e2e_ms:      avg=%.3f  min=%.3f  max=%.3f\n", avg_e2e_ms, min_e2e_ms, max_e2e_ms);
   printf("postproc_ms: %.3f\n", avg_pp_ms);
   if (pp == PP_SEG_PREDIST || pp == PP_SEG_PREDFL) {
-    printf("output_sync: avg_ms=%.3f  avg_native_bytes=%.0f\n", avg_sync_ms,
-           avg_sync_bytes);
-    printf("mask_verify: avg_ms=%.3f (excluded from postproc/e2e)\n",
-           avg_mask_verify_ms);
+    printf("output_sync: avg_ms=%.3f  avg_native_bytes=%.0f\n", avg_sync_ms, avg_sync_bytes);
+    printf("mask_verify: avg_ms=%.3f (excluded from postproc/e2e)\n", avg_mask_verify_ms);
   }
   for (int i = 0; i < fps_workers; i++) {
-    double worker_avg =
-        args[i].frames > 0 ? args[i].sum_e2e_ms / (double)args[i].frames : 0.0;
-    printf("worker[%d]:   frames=%ld  avg_e2e_ms=%.3f  last_kept=%d  "
-           "ready=0x%02x  outcome=%s\n",
-           i, args[i].frames, worker_avg, args[i].last_kept,
-           args[i].last_ready_mask,
-           args[i].last_fetch_outcome ? args[i].last_fetch_outcome : "none");
+    double worker_avg = args[i].frames > 0 ? args[i].sum_e2e_ms / (double)args[i].frames : 0.0;
+    printf(
+        "worker[%d]:   frames=%ld  avg_e2e_ms=%.3f  last_kept=%d  "
+        "ready=0x%02x  outcome=%s\n",
+        i, args[i].frames, worker_avg, args[i].last_kept, args[i].last_ready_mask,
+        args[i].last_fetch_outcome ? args[i].last_fetch_outcome : "none");
   }
 
   if (json_out) {
@@ -1746,17 +1752,13 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
               "\"mask_class_ids\":\"%s\",\"mask_output_size\":\"%dx%d\","
               "\"ready_mask\":%u,\"fetch_outcome\":\"%s\","
               "\"worker_frames\":[",
-              model_path, core_str, fps_core_map ? fps_core_map : "", sram_str,
-              init_flags, pp_str, fps_workers, fps_seconds, measured_s, warmup,
-              HAVE_NEON, total_frames, fps, avg_e2e_ms, min_e2e_ms, max_e2e_ms,
-              avg_pp_ms, avg_sync_ms, avg_sync_bytes,
-              g_score_sum_enabled ? "on" : "off",
-              g_mask_verify_enabled ? "on" : "off", avg_mask_verify_ms,
-              g_mask_class_ids_spec, g_mask_output_width, g_mask_output_height,
+              model_path, core_str, fps_core_map ? fps_core_map : "", sram_str, init_flags, pp_str,
+              fps_workers, fps_seconds, measured_s, warmup, HAVE_NEON, total_frames, fps,
+              avg_e2e_ms, min_e2e_ms, max_e2e_ms, avg_pp_ms, avg_sync_ms, avg_sync_bytes,
+              g_score_sum_enabled ? "on" : "off", g_mask_verify_enabled ? "on" : "off",
+              avg_mask_verify_ms, g_mask_class_ids_spec, g_mask_output_width, g_mask_output_height,
               fps_workers > 0 ? args[0].last_ready_mask : 0U,
-              fps_workers > 0 && args[0].last_fetch_outcome
-                  ? args[0].last_fetch_outcome
-                  : "none");
+              fps_workers > 0 && args[0].last_fetch_outcome ? args[0].last_fetch_outcome : "none");
       for (int i = 0; i < fps_workers; i++) {
         fprintf(jp, "%s%ld", i ? "," : "", args[i].frames);
       }
@@ -1767,8 +1769,7 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
       fprintf(jp, "],\"worker_fetch_outcomes\":[");
       for (int i = 0; i < fps_workers; i++) {
         fprintf(jp, "%s\"%s\"", i ? "," : "",
-                args[i].last_fetch_outcome ? args[i].last_fetch_outcome
-                                           : "none");
+                args[i].last_fetch_outcome ? args[i].last_fetch_outcome : "none");
       }
       fprintf(jp, "]}\n");
       fclose(jp);
@@ -1778,28 +1779,27 @@ static int run_fps_mode(const char *model_path, const void *model_buf,
 }
 
 static void usage(const char *prog) {
-  fprintf(
-      stderr,
-      "用法: %s --model M.rknn [选项]\n"
-      "  --warmup N        预热轮次 (默认 10)\n"
-      "  --runs   N        计时轮次 (默认 200)\n"
-      "  --core   0|1|2|all   NPU 核心选择 (默认 all)\n"
-      "  --postproc predist|predfl|seg_predist|seg_predfl|none  CPU 后处理 "
-      "(默认 none)\n"
-      "  --conf-thr F      后处理置信度阈值 (默认 0.25)\n"
-      "  --iou-thr F       NMS IoU 阈值 (默认 0.45)\n"
-      "  --max-det N       NMS 后最多保留实例数 (默认 300)\n"
-      "  --score-sum on|off  分割模型 score_sum 预筛 A/B (默认 on)\n"
-      "  --mask-verify on|off  mask 像素计数/hash 校验 (默认 off)\n"
-      "  --mask-class-ids all|L  生成 mask 的类别 ID，如 0,1 (默认 0)\n"
-      "  --mask-output-size WxH  mask 输出坐标尺寸 (默认 640x480)\n"
-      "  --input F.rgb     单帧 HWC RGB uint8 原始输入；仅延迟模式使用\n"
-      "  --sram off|private|shared  RKNN SRAM 初始化策略 (默认 off)\n"
-      "  --fps-workers N   离线 FPS worker/context 数；设置后进入 FPS 模式\n"
-      "  --fps-seconds F   离线 FPS 计时秒数 (默认 10)\n"
-      "  --fps-core-map L  FPS worker core 轮转列表，如 0,1,2 或 all,all\n"
-      "  --json   F.json   写出机器可读结果\n",
-      prog);
+  fprintf(stderr,
+          "用法: %s --model M.rknn [选项]\n"
+          "  --warmup N        预热轮次 (默认 10)\n"
+          "  --runs   N        计时轮次 (默认 200)\n"
+          "  --core   0|1|2|all   NPU 核心选择 (默认 all)\n"
+          "  --postproc predist|predfl|seg_predist|seg_predfl|none  CPU 后处理 "
+          "(默认 none)\n"
+          "  --conf-thr F      后处理置信度阈值 (默认 0.25)\n"
+          "  --iou-thr F       YOLOv8 NMS IoU 阈值 (默认 0.45)\n"
+          "  --max-det N       YOLO26 TopK / YOLOv8 NMS 上限 (默认 300)\n"
+          "  --score-sum on|off  仅 seg_predfl 五输出预筛 (默认 on)\n"
+          "  --mask-verify on|off  mask 像素计数/hash 校验 (默认 off)\n"
+          "  --mask-class-ids all|L  生成 mask 的类别 ID，如 0,1 (默认 0)\n"
+          "  --mask-output-size WxH  mask 输出坐标尺寸 (默认 640x480)\n"
+          "  --input F.rgb     单帧 HWC RGB uint8 原始输入；仅延迟模式使用\n"
+          "  --sram off|private|shared  RKNN SRAM 初始化策略 (默认 off)\n"
+          "  --fps-workers N   离线 FPS worker/context 数；设置后进入 FPS 模式\n"
+          "  --fps-seconds F   离线 FPS 计时秒数 (默认 10)\n"
+          "  --fps-core-map L  FPS worker core 轮转列表，如 0,1,2 或 all,all\n"
+          "  --json   F.json   写出机器可读结果\n",
+          prog);
 }
 
 int main(int argc, char **argv) {
@@ -1821,107 +1821,103 @@ int main(int argc, char **argv) {
   float iou_thr = 0.45f;
   int max_det = 300;
 
-  static struct option opts[] = {
-      {"model", required_argument, 0, 'm'},
-      {"warmup", required_argument, 0, 'w'},
-      {"runs", required_argument, 0, 'r'},
-      {"core", required_argument, 0, 'c'},
-      {"postproc", required_argument, 0, 'p'},
-      {"conf-thr", required_argument, 0, 't'},
-      {"iou-thr", required_argument, 0, 1003},
-      {"max-det", required_argument, 0, 1004},
-      {"score-sum", required_argument, 0, 1005},
-      {"input", required_argument, 0, 1006},
-      {"mask-verify", required_argument, 0, 1007},
-      {"mask-class-ids", required_argument, 0, 1008},
-      {"mask-output-size", required_argument, 0, 1009},
-      {"json", required_argument, 0, 'j'},
-      {"sram", required_argument, 0, 's'},
-      {"fps-workers", required_argument, 0, 1000},
-      {"fps-seconds", required_argument, 0, 1001},
-      {"fps-core-map", required_argument, 0, 1002},
-      {"help", no_argument, 0, 'h'},
-      {0, 0, 0, 0}};
+  static struct option opts[] = {{"model", required_argument, 0, 'm'},
+                                 {"warmup", required_argument, 0, 'w'},
+                                 {"runs", required_argument, 0, 'r'},
+                                 {"core", required_argument, 0, 'c'},
+                                 {"postproc", required_argument, 0, 'p'},
+                                 {"conf-thr", required_argument, 0, 't'},
+                                 {"iou-thr", required_argument, 0, 1003},
+                                 {"max-det", required_argument, 0, 1004},
+                                 {"score-sum", required_argument, 0, 1005},
+                                 {"input", required_argument, 0, 1006},
+                                 {"mask-verify", required_argument, 0, 1007},
+                                 {"mask-class-ids", required_argument, 0, 1008},
+                                 {"mask-output-size", required_argument, 0, 1009},
+                                 {"json", required_argument, 0, 'j'},
+                                 {"sram", required_argument, 0, 's'},
+                                 {"fps-workers", required_argument, 0, 1000},
+                                 {"fps-seconds", required_argument, 0, 1001},
+                                 {"fps-core-map", required_argument, 0, 1002},
+                                 {"help", no_argument, 0, 'h'},
+                                 {0, 0, 0, 0}};
   int opt;
-  while ((opt = getopt_long(argc, argv, "m:w:r:c:p:t:j:s:h", opts, NULL)) !=
-         -1) {
+  while ((opt = getopt_long(argc, argv, "m:w:r:c:p:t:j:s:h", opts, NULL)) != -1) {
     switch (opt) {
-    case 'm':
-      model_path = optarg;
-      break;
-    case 'w':
-      warmup = atoi(optarg);
-      break;
-    case 'r':
-      runs = atoi(optarg);
-      break;
-    case 'c':
-      core_str = optarg;
-      break;
-    case 'p':
-      pp_str = optarg;
-      break;
-    case 't':
-      conf_thr = (float)atof(optarg);
-      break;
-    case 'j':
-      json_out = optarg;
-      break;
-    case 's':
-      sram_str = normalize_sram_mode(optarg);
-      break;
-    case 1000:
-      fps_workers = atoi(optarg);
-      break;
-    case 1001:
-      fps_seconds = atof(optarg);
-      break;
-    case 1002:
-      fps_core_map = optarg;
-      break;
-    case 1003:
-      iou_thr = (float)atof(optarg);
-      break;
-    case 1004:
-      max_det = atoi(optarg);
-      break;
-    case 1005:
-      score_sum_str = optarg;
-      break;
-    case 1006:
-      input_path = optarg;
-      break;
-    case 1007:
-      mask_verify_str = optarg;
-      break;
-    case 1008:
-      mask_class_ids_str = optarg;
-      break;
-    case 1009:
-      mask_output_size_str = optarg;
-      break;
-    case 'h':
-      usage(argv[0]);
-      return 0;
-    default:
-      usage(argv[0]);
-      return 2;
+      case 'm':
+        model_path = optarg;
+        break;
+      case 'w':
+        warmup = atoi(optarg);
+        break;
+      case 'r':
+        runs = atoi(optarg);
+        break;
+      case 'c':
+        core_str = optarg;
+        break;
+      case 'p':
+        pp_str = optarg;
+        break;
+      case 't':
+        conf_thr = (float)atof(optarg);
+        break;
+      case 'j':
+        json_out = optarg;
+        break;
+      case 's':
+        sram_str = normalize_sram_mode(optarg);
+        break;
+      case 1000:
+        fps_workers = atoi(optarg);
+        break;
+      case 1001:
+        fps_seconds = atof(optarg);
+        break;
+      case 1002:
+        fps_core_map = optarg;
+        break;
+      case 1003:
+        iou_thr = (float)atof(optarg);
+        break;
+      case 1004:
+        max_det = atoi(optarg);
+        break;
+      case 1005:
+        score_sum_str = optarg;
+        break;
+      case 1006:
+        input_path = optarg;
+        break;
+      case 1007:
+        mask_verify_str = optarg;
+        break;
+      case 1008:
+        mask_class_ids_str = optarg;
+        break;
+      case 1009:
+        mask_output_size_str = optarg;
+        break;
+      case 'h':
+        usage(argv[0]);
+        return 0;
+      default:
+        usage(argv[0]);
+        return 2;
     }
   }
   if (!model_path) {
     usage(argv[0]);
     return 2;
   }
-  if (warmup < 0 || runs <= 0 || !std::isfinite(conf_thr) || conf_thr < 0.f ||
-      conf_thr > 1.f || !std::isfinite(iou_thr) || iou_thr < 0.f ||
-      iou_thr > 1.f || max_det <= 0 || fps_workers < 0 ||
-      !std::isfinite(fps_seconds) || fps_seconds <= 0.0) {
+  if (warmup < 0 || runs <= 0 || !std::isfinite(conf_thr) || conf_thr < 0.f || conf_thr > 1.f ||
+      !std::isfinite(iou_thr) || iou_thr < 0.f || iou_thr > 1.f || max_det <= 0 ||
+      fps_workers < 0 || !std::isfinite(fps_seconds) || fps_seconds <= 0.0) {
     fprintf(stderr, "invalid numeric CLI value\n");
     return 2;
   }
-  if (strcmp(pp_str, "none") && strcmp(pp_str, "predist") &&
-      strcmp(pp_str, "predfl") && strcmp(pp_str, "seg_predist") &&
-      strcmp(pp_str, "seg_predfl")) {
+  if (strcmp(pp_str, "none") && strcmp(pp_str, "predist") && strcmp(pp_str, "predfl") &&
+      strcmp(pp_str, "seg_predist") && strcmp(pp_str, "seg_predfl")) {
     fprintf(stderr, "invalid --postproc value: %s\n", pp_str);
     return 2;
   }
@@ -1943,19 +1939,17 @@ int main(int argc, char **argv) {
     return 2;
   }
   if (!parse_mask_output_size(mask_output_size_str)) {
-    fprintf(stderr, "invalid --mask-output-size value: %s\n",
-            mask_output_size_str);
+    fprintf(stderr, "invalid --mask-output-size value: %s\n", mask_output_size_str);
     return 2;
   }
   if (fps_workers > 0 && input_path) {
-    fprintf(stderr,
-            "--input is only supported in single-context latency mode\n");
+    fprintf(stderr, "--input is only supported in single-context latency mode\n");
     return 2;
   }
-  g_score_sum_enabled = !strcmp(score_sum_str, "on");
   g_mask_verify_enabled = !strcmp(mask_verify_str, "on");
   g_mask_class_ids_spec = mask_class_ids_str;
   pp_mode_t pp = parse_pp(pp_str);
+  g_score_sum_enabled = pp == PP_SEG_PREDFL && !strcmp(score_sum_str, "on");
   uint32_t init_flags = parse_sram_flags(sram_str);
 
   FILE *fp = fopen(model_path, "rb");
@@ -1975,18 +1969,18 @@ int main(int argc, char **argv) {
   }
   fclose(fp);
 
-  if (fps_workers == 1 && is_shared_sram_mode(sram_str) &&
-      flags_request_shared_sram(init_flags)) {
-    fprintf(stderr, "single-worker --sram shared has no consumer context; "
-                    "using private SRAM\n");
+  if (fps_workers == 1 && is_shared_sram_mode(sram_str) && flags_request_shared_sram(init_flags)) {
+    fprintf(stderr,
+            "single-worker --sram shared has no consumer context; "
+            "using private SRAM\n");
     sram_str = "private";
     init_flags = parse_sram_flags(sram_str);
   }
 
   if (fps_workers > 0) {
-    int ret = run_fps_mode(model_path, buf, sz, json_out, pp_str, pp, conf_thr,
-                           iou_thr, max_det, warmup, core_str, fps_core_map,
-                           sram_str, init_flags, fps_workers, fps_seconds);
+    int ret =
+        run_fps_mode(model_path, buf, sz, json_out, pp_str, pp, conf_thr, iou_thr, max_det, warmup,
+                     core_str, fps_core_map, sram_str, init_flags, fps_workers, fps_seconds);
     free(buf);
     return ret;
   }
@@ -1995,13 +1989,13 @@ int main(int argc, char **argv) {
   rknn_init_extend init_extend;
   memset(&init_extend, 0, sizeof(init_extend));
   if (is_shared_sram_mode(sram_str) && flags_request_shared_sram(init_flags)) {
-    fprintf(stderr, "single-context --sram shared has no source context; using "
-                    "private SRAM\n");
+    fprintf(stderr,
+            "single-context --sram shared has no source context; using "
+            "private SRAM\n");
     sram_str = "private";
     init_flags = parse_sram_flags("private");
   }
-  int ret =
-      rknn_init(&ctx, buf, sz, init_flags, init_flags ? &init_extend : NULL);
+  int ret = rknn_init(&ctx, buf, sz, init_flags, init_flags ? &init_extend : NULL);
   free(buf);
   if (ret < 0) {
     fprintf(stderr, "rknn_init: %d\n", ret);
@@ -2022,8 +2016,7 @@ int main(int argc, char **argv) {
 
   rknn_sdk_version sdk_ver;
   memset(&sdk_ver, 0, sizeof(sdk_ver));
-  int sdk_ret =
-      rknn_query(ctx, RKNN_QUERY_SDK_VERSION, &sdk_ver, sizeof(sdk_ver));
+  int sdk_ret = rknn_query(ctx, RKNN_QUERY_SDK_VERSION, &sdk_ver, sizeof(sdk_ver));
 
   rknn_input_output_num io;
   memset(&io, 0, sizeof(io));
@@ -2034,8 +2027,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (io.n_input < 1 || io.n_input > MAX_IO || io.n_output > MAX_IO) {
-    fprintf(stderr, "unsupported io count: input=%u output=%u\n", io.n_input,
-            io.n_output);
+    fprintf(stderr, "unsupported io count: input=%u output=%u\n", io.n_input, io.n_output);
     rknn_destroy(ctx);
     return 1;
   }
@@ -2048,8 +2040,7 @@ int main(int argc, char **argv) {
   for (uint32_t i = 0; i < io.n_input && i < MAX_IO; i++) {
     memset(&in_attrs[i], 0, sizeof(in_attrs[i]));
     in_attrs[i].index = i;
-    ret = rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, &in_attrs[i],
-                     sizeof(in_attrs[i]));
+    ret = rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, &in_attrs[i], sizeof(in_attrs[i]));
     if (ret < 0) {
       fprintf(stderr, "RKNN_QUERY_INPUT_ATTR[%u]: %d\n", i, ret);
       rknn_destroy(ctx);
@@ -2060,8 +2051,7 @@ int main(int argc, char **argv) {
   for (uint32_t i = 0; i < io.n_output && i < MAX_IO; i++) {
     memset(&out_attrs[i], 0, sizeof(out_attrs[i]));
     out_attrs[i].index = i;
-    ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attrs[i],
-                     sizeof(out_attrs[i]));
+    ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attrs[i], sizeof(out_attrs[i]));
     if (ret < 0) {
       fprintf(stderr, "RKNN_QUERY_OUTPUT_ATTR[%u]: %d\n", i, ret);
       rknn_destroy(ctx);
@@ -2111,8 +2101,7 @@ int main(int argc, char **argv) {
     int trailing = fgetc(input_file);
     fclose(input_file);
     if (input_read != in_size || trailing != EOF) {
-      fprintf(stderr, "input size mismatch: expected exactly %zu bytes\n",
-              in_size);
+      fprintf(stderr, "input size mismatch: expected exactly %zu bytes\n", in_size);
       free(dummy);
       rknn_destroy(ctx);
       return 1;
@@ -2127,11 +2116,11 @@ int main(int argc, char **argv) {
   inp[0].type = RKNN_TENSOR_UINT8;
   inp[0].fmt = RKNN_TENSOR_NHWC;
 
-  paddleyolo_rknn::postprocess::FiveOutputRuntime full_io;
+  paddleyolo_rknn::postprocess::FullIoRuntime full_io;
   if (pp == PP_SEG_PREDIST || pp == PP_SEG_PREDFL) {
     if (!full_io.Initialize(ctx, in_attrs[0], out_attrs, io.n_output) ||
         !full_io.SetInput(dummy, in_size)) {
-      fprintf(stderr, "five-output full-IO initialization failed\n");
+      fprintf(stderr, "segmentation full-IO initialization failed\n");
       full_io.Release();
       free(dummy);
       rknn_destroy(ctx);
@@ -2151,11 +2140,9 @@ int main(int argc, char **argv) {
         rknn_destroy(ctx);
         return 1;
       }
-      run_staged_seg_postproc(&full_io, out_attrs, pp == PP_SEG_PREDFL,
-                              conf_thr, iou_thr, max_det);
+      run_staged_seg_postproc(&full_io, out_attrs, pp == PP_SEG_PREDFL, conf_thr, iou_thr, max_det);
       if (staged_postproc_failed()) {
-        fprintf(stderr, "warmup staged postprocess failed: %s\n",
-                g_last_fetch_outcome);
+        fprintf(stderr, "warmup staged postprocess failed: %s\n", g_last_fetch_outcome);
         full_io.Release();
         free(dummy);
         rknn_destroy(ctx);
@@ -2203,8 +2190,7 @@ int main(int argc, char **argv) {
   double *npu_times = (double *)malloc(runs * sizeof(double));
   double *io_wall_times = (double *)malloc(runs * sizeof(double));
   double *e2e_times = (double *)malloc(runs * sizeof(double));
-  if (npu_times == nullptr || io_wall_times == nullptr ||
-      e2e_times == nullptr) {
+  if (npu_times == nullptr || io_wall_times == nullptr || e2e_times == nullptr) {
     fprintf(stderr, "timing allocation failed: runs=%d\n", runs);
     free(npu_times);
     free(io_wall_times);
@@ -2235,11 +2221,10 @@ int main(int argc, char **argv) {
         return 1;
       }
       const double run_end = now_ms();
-      double pp_ms = run_staged_seg_postproc(
-          &full_io, out_attrs, pp == PP_SEG_PREDFL, conf_thr, iou_thr, max_det);
+      double pp_ms = run_staged_seg_postproc(&full_io, out_attrs, pp == PP_SEG_PREDFL, conf_thr,
+                                             iou_thr, max_det);
       if (staged_postproc_failed()) {
-        fprintf(stderr, "staged postprocess failed: %s\n",
-                g_last_fetch_outcome);
+        fprintf(stderr, "staged postprocess failed: %s\n", g_last_fetch_outcome);
         free(npu_times);
         free(io_wall_times);
         free(e2e_times);
@@ -2255,8 +2240,8 @@ int main(int argc, char **argv) {
       memset(&perf_run, 0, sizeof(perf_run));
       ret = rknn_query(ctx, RKNN_QUERY_PERF_RUN, &perf_run, sizeof(perf_run));
       if (ret < 0 || perf_run.run_duration <= 0) {
-        fprintf(stderr, "RKNN_QUERY_PERF_RUN failed: ret=%d duration=%lldus\n",
-                ret, (long long)perf_run.run_duration);
+        fprintf(stderr, "RKNN_QUERY_PERF_RUN failed: ret=%d duration=%lldus\n", ret,
+                (long long)perf_run.run_duration);
         free(npu_times);
         free(io_wall_times);
         free(e2e_times);
@@ -2328,12 +2313,11 @@ int main(int argc, char **argv) {
     memset(&perf_run, 0, sizeof(perf_run));
     ret = rknn_query(ctx, RKNN_QUERY_PERF_RUN, &perf_run, sizeof(perf_run));
     if (ret < 0 || perf_run.run_duration <= 0) {
-      fprintf(stderr, "RKNN_QUERY_PERF_RUN failed: ret=%d duration=%lldus\n",
-              ret, (long long)perf_run.run_duration);
+      fprintf(stderr, "RKNN_QUERY_PERF_RUN failed: ret=%d duration=%lldus\n", ret,
+              (long long)perf_run.run_duration);
       const int release_ret = rknn_outputs_release(ctx, io.n_output, outs);
       if (release_ret < 0) {
-        fprintf(stderr, "rknn_outputs_release after query failure: %d\n",
-                release_ret);
+        fprintf(stderr, "rknn_outputs_release after query failure: %d\n", release_ret);
       }
       free(npu_times);
       free(io_wall_times);
@@ -2350,8 +2334,7 @@ int main(int argc, char **argv) {
     sum_npu_ms += npu_ms;
     sum_io_wall_ms += io_wall_ms;
 
-    double pp_ms = run_postproc(pp, outs, out_attrs, io.n_output, conf_thr,
-                                iou_thr, max_det);
+    double pp_ms = run_postproc(pp, outs, out_attrs, io.n_output, conf_thr, iou_thr, max_det);
     sum_pp_ms += pp_ms;
 
     double release_start = now_ms();
@@ -2418,46 +2401,46 @@ int main(int argc, char **argv) {
 
   printf("\n=== bench_rknn_perf ===\n");
   printf("model:       %s\n", model_path);
-  printf("core:        %s   neon: %d   runs: %d  warmup: %d\n", core_str,
-         HAVE_NEON, runs, warmup);
+  printf("core:        %s   neon: %d   runs: %d  warmup: %d\n", core_str, HAVE_NEON, runs, warmup);
   printf("sram:        %s   init_flags: 0x%08x\n", sram_str, init_flags);
   printf("postproc:    %s\n", pp_str);
-  printf("score_sum:   %s\n", score_sum_str);
+  printf("score_sum:   %s\n", g_score_sum_enabled ? "on" : "off");
   printf("mask_verify: %s\n", mask_verify_str);
   printf("mask_classes: %s\n", g_mask_class_ids_spec);
   printf("mask_size:    %dx%d\n", g_mask_output_width, g_mask_output_height);
   if (sdk_ret == 0) {
-    printf("rknn_sdk:    api=%s   drv=%s\n", sdk_ver.api_version,
-           sdk_ver.drv_version);
+    printf("rknn_sdk:    api=%s   drv=%s\n", sdk_ver.api_version, sdk_ver.drv_version);
   }
-  printf("npu_pure_ms: best=%.3f  P50=%.3f  P90=%.3f  avg=%.3f  "
-         "(RKNN_QUERY_PERF_RUN)\n",
-         npu_best, npu_p50, npu_p90, npu_avg_ms);
-  printf("io_wall_ms:  best=%.3f  P50=%.3f  P90=%.3f  avg=%.3f\n", io_wall_best,
-         io_wall_p50, io_wall_p90, io_wall_avg_ms);
+  printf(
+      "npu_pure_ms: best=%.3f  P50=%.3f  P90=%.3f  avg=%.3f  "
+      "(RKNN_QUERY_PERF_RUN)\n",
+      npu_best, npu_p50, npu_p90, npu_avg_ms);
+  printf("io_wall_ms:  best=%.3f  P50=%.3f  P90=%.3f  avg=%.3f\n", io_wall_best, io_wall_p50,
+         io_wall_p90, io_wall_avg_ms);
   printf("postproc_ms: %.3f\n", pp_avg_ms);
   if (pp != PP_NONE) {
     printf("postproc_kept: %d\n", g_last_kept);
-    printf("postproc_candidates: %d  nms_pairs=%ld  score_sum_applied=%d  "
-           "score_sum_scanned=%d  class_anchors=%d  class_values=%ld\n",
-           g_last_candidates, g_last_nms_pairs, g_last_score_sum_applied,
-           g_last_sum_scanned, g_last_class_anchors, g_last_class_values);
+    printf(
+        "postproc_candidates: %d  nms_pairs=%ld  score_sum_applied=%d  "
+        "score_sum_scanned=%d  class_anchors=%d  class_values=%ld\n",
+        g_last_candidates, g_last_nms_pairs, g_last_score_sum_applied, g_last_sum_scanned,
+        g_last_class_anchors, g_last_class_values);
     if (pp == PP_SEG_PREDIST || pp == PP_SEG_PREDFL) {
-      printf("mask_tail: mode=%s proto_roi_area=%ld resized_pixels=%ld "
-             "active_pixels=%ld hash=%016llx verify_avg_ms=%.3f\n",
-             g_last_mask_mode, g_last_proto_roi_area, g_last_mask_pixels,
-             g_last_mask_active, (unsigned long long)g_last_mask_hash,
-             mask_verify_avg_ms);
-      printf("output_sync: avg_ms=%.3f avg_native_bytes=%.0f ready=0x%02x "
-             "outcome=%s\n",
-             output_sync_avg_ms, native_sync_bytes_avg, g_last_ready_mask,
-             g_last_fetch_outcome);
+      printf(
+          "mask_tail: mode=%s proto_roi_area=%ld resized_pixels=%ld "
+          "active_pixels=%ld hash=%016llx verify_avg_ms=%.3f\n",
+          g_last_mask_mode, g_last_proto_roi_area, g_last_mask_pixels, g_last_mask_active,
+          (unsigned long long)g_last_mask_hash, mask_verify_avg_ms);
+      printf(
+          "output_sync: avg_ms=%.3f avg_native_bytes=%.0f ready=0x%02x "
+          "outcome=%s\n",
+          output_sync_avg_ms, native_sync_bytes_avg, g_last_ready_mask, g_last_fetch_outcome);
     }
   }
-  printf("e2e_ms:      best=%.3f  P50=%.3f  P90=%.3f  avg=%.3f  (%.1f FPS "
-         "best, %.1f FPS P50)\n",
-         e2e_best, e2e_p50, e2e_p90, e2e_avg_ms, 1000.0 / e2e_best,
-         1000.0 / e2e_p50);
+  printf(
+      "e2e_ms:      best=%.3f  P50=%.3f  P90=%.3f  avg=%.3f  (%.1f FPS "
+      "best, %.1f FPS P50)\n",
+      e2e_best, e2e_p50, e2e_p90, e2e_avg_ms, 1000.0 / e2e_best, 1000.0 / e2e_p50);
 
   free(npu_times);
   free(io_wall_times);
@@ -2488,20 +2471,17 @@ int main(int argc, char **argv) {
               "hash\":\"%016llx\","
               "\"e2e_best_ms\":%.4f,\"e2e_p50_ms\":%.4f,\"e2e_p90_ms\":%.4f,"
               "\"e2e_avg_ms\":%.4f}\n",
-              model_path, core_str, sram_str, init_flags, pp_str, score_sum_str,
-              runs, warmup, HAVE_NEON,
+              model_path, core_str, sram_str, init_flags, pp_str,
+              g_score_sum_enabled ? "on" : "off", runs, warmup, HAVE_NEON,
               sdk_ret == 0 ? sdk_ver.api_version : "unknown",
-              sdk_ret == 0 ? sdk_ver.drv_version : "unknown", npu_best, npu_p50,
-              npu_p90, npu_avg_ms, io_wall_best, io_wall_p50, io_wall_p90,
-              io_wall_avg_ms, pp_avg_ms, g_last_candidates, g_last_kept,
-              g_last_nms_pairs, g_last_score_sum_applied, g_last_sum_scanned,
-              g_last_class_anchors, g_last_class_values, output_sync_avg_ms,
-              native_sync_bytes_avg, g_last_ready_mask, g_last_fetch_outcome,
-              mask_verify_str, mask_verify_avg_ms, g_mask_class_ids_spec,
-              g_mask_output_width, g_mask_output_height, g_last_mask_mode,
-              g_last_proto_roi_area, g_last_mask_pixels, g_last_mask_active,
-              (unsigned long long)g_last_mask_hash, e2e_best, e2e_p50, e2e_p90,
-              e2e_avg_ms);
+              sdk_ret == 0 ? sdk_ver.drv_version : "unknown", npu_best, npu_p50, npu_p90,
+              npu_avg_ms, io_wall_best, io_wall_p50, io_wall_p90, io_wall_avg_ms, pp_avg_ms,
+              g_last_candidates, g_last_kept, g_last_nms_pairs, g_last_score_sum_applied,
+              g_last_sum_scanned, g_last_class_anchors, g_last_class_values, output_sync_avg_ms,
+              native_sync_bytes_avg, g_last_ready_mask, g_last_fetch_outcome, mask_verify_str,
+              mask_verify_avg_ms, g_mask_class_ids_spec, g_mask_output_width, g_mask_output_height,
+              g_last_mask_mode, g_last_proto_roi_area, g_last_mask_pixels, g_last_mask_active,
+              (unsigned long long)g_last_mask_hash, e2e_best, e2e_p50, e2e_p90, e2e_avg_ms);
       fclose(jp);
     }
   }

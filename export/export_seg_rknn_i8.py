@@ -7,12 +7,12 @@
 @details
 用户可以直接传入 Paddle 权重或 ONNX，脚本内部会自动执行：
 1. 导出普通 seg ONNX；
-2. 识别并裁剪到统一五输出的 `seg_pre_dist` 或 `seg_pre_dfl` 主线；
+2. 识别并裁剪到 YOLO26 四输出 `seg_pre_dist` 或 YOLOv8 五输出 `seg_pre_dfl` 主线；
 3. 生成 RKNN INT8 模型（RGB 校准）。
 
 两条主线分别对应：
-- `seg_pre_dist`：YOLO26-Seg，CPU 端做 dist2bbox + mask 重建；
-- `seg_pre_dfl`：YOLOv8-Seg，CPU 端额外执行 DFL softmax-expectation。
+- `seg_pre_dist`：YOLO26-Seg，CPU 端做 dist2bbox + exact TopK + mask 重建，无 NMS；
+- `seg_pre_dfl`：YOLOv8-Seg，CPU 端执行 DFL softmax-expectation + NMS。
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz
 
 
 def _cleanup_paths(paths: list[str]) -> None:
@@ -54,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", required=True, help="校准数据集 YAML")
     p.add_argument("--output", default=None, help="输出 .rknn 路径")
     p.add_argument("--target", default="rk3588", choices=["rk3588", "rk3588s", "rk3576", "rk3562"])
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", nargs="+", type=int, default=[640], metavar="SIZE", help="输入尺寸：SIZE 或 H W")
     p.add_argument("--calib-images", type=int, default=50)
     p.add_argument("--calib-offset", type=int, default=0, help="校准图片起始偏移，用于避免与评测集重叠")
     p.add_argument("--algorithm", default="auto", choices=["auto", "normal", "mmse", "kl_divergence"])
@@ -75,11 +77,12 @@ def default_algorithm(route: str, requested: str) -> str:
     return "normal"
 
 
-def default_output_path(weights_path: str, route: str, imgsz: int) -> str:
+def default_output_path(weights_path: str, route: str, imgsz: StaticInputShape) -> str:
     """!
     @brief 生成默认 RKNN 输出路径。
     @param weights_path 用户输入权重路径。
     @param route 推断出的 seg 主线，`seg_pre_dist` 或 `seg_pre_dfl`。
+    @param imgsz 静态输入尺寸，正方形为单个边长，矩形为 `(H, W)`。
     @return 默认输出 `.rknn` 绝对路径，位于输入模型同目录。
     """
     p = Path(weights_path)
@@ -95,14 +98,15 @@ def default_output_path(weights_path: str, route: str, imgsz: int) -> str:
                 stem = stem[len(prefix) :]
                 break
     base = stem.split("_paddle_", 1)[0]
-    return str((p.parent / f"{base}_paddle_{route_tag}_int8_{imgsz}.rknn").resolve())
+    shape_tag = format_static_imgsz(imgsz)
+    return str((p.parent / f"{base}_paddle_{route_tag}_int8_{shape_tag}.rknn").resolve())
 
 
 def build_rknn_int8(
     onnx_path: str,
     output_path: str,
     data_yaml: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     target: str,
     calib_images: int,
     algorithm: str,
@@ -114,7 +118,7 @@ def build_rknn_int8(
     @param onnx_path 已准备好的 `seg_pre_dist` 或 `seg_pre_dfl` ONNX 路径。
     @param output_path 输出 `.rknn` 路径。
     @param data_yaml 校准数据集 YAML。
-    @param imgsz 校准输入尺寸。
+    @param imgsz 校准输入尺寸，正方形为单个边长，矩形为 `(H, W)`。
     @param target 目标平台。
     @param calib_images 校准图像数量。
     @param algorithm 量化算法。
@@ -168,6 +172,7 @@ def main() -> int:
     @return 成功返回 `0`。
     """
     args = parse_args()
+    imgsz = normalize_static_imgsz(args.imgsz)
 
     from export.seg_onnx_routes import prepare_seg_onnx_i8_input
     from export.export_rknn import isolated_rknn_workspace, prepare_onnx
@@ -175,7 +180,7 @@ def main() -> int:
 
     route, prepared_onnx_path, cleanup_paths = prepare_seg_onnx_i8_input(
         str(args.weights),
-        args.imgsz,
+        imgsz,
         auto_export_onnx,
     )
     public_route = "seg_predfl" if route == "seg_pre_dfl" else "seg_predist"
@@ -188,7 +193,7 @@ def main() -> int:
         fixed_onnx = prepare_onnx(prepared_onnx_path, fix_paddle=not args.no_fix)
         if fixed_onnx != prepared_onnx_path:
             cleanup_paths.append(fixed_onnx)
-        output_path = args.output or default_output_path(str(args.weights), route, args.imgsz)
+        output_path = args.output or default_output_path(str(args.weights), route, imgsz)
         print(f"[SEG-RKNN-I8] route={route} algorithm={algorithm}")
         print(f"[SEG-RKNN-I8] onnx={fixed_onnx}")
         print(f"[SEG-RKNN-I8] output={output_path}")
@@ -200,7 +205,7 @@ def main() -> int:
                 fixed_onnx,
                 output_path,
                 args.data,
-                args.imgsz,
+                imgsz,
                 args.target,
                 args.calib_images,
                 algorithm,

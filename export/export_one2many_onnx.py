@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Dengdxx <dengdx@tju.edu.cn>
 # SPDX-License-Identifier: AGPL-3.0-only
-"""导出 YOLO26-seg 系列 one2many raw ONNX。
+"""导出 YOLO26-seg 训练辅助头的 one2many raw ONNX。
 
-该脚本只生成 ONNX 中间产物；分割 RKNN 必须交给
-``export_seg_rknn_i8.py`` 规范化为统一五输出后编译。
+该脚本仅用于训练辅助头诊断，产物不得进入 RKNN 部署链。
+YOLO26 部署必须使用 one-to-one `seg_pre_dist` 四输出。
 """
 
 import argparse

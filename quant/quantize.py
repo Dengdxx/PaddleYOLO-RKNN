@@ -62,6 +62,7 @@ from export.det_onnx_routes import (
     infer_det_onnx_i8_route as _infer_det_onnx_i8_route,
     prepare_det_onnx_i8_input,
 )
+from export.input_shape import StaticInputShape, static_imgsz_hw
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -82,7 +83,7 @@ def detect_supported_onnx_i8_route(onnx_model) -> str:
         raise ValueError("ONNX INT8 仅支持 pre_dist / pre_dfl，当前 ONNX 输出契约不受支持。") from exc
 
 
-def auto_export_onnx(weights_path: str, imgsz: int) -> str:
+def auto_export_onnx(weights_path: str, imgsz: StaticInputShape) -> str:
     """!
     @brief 将 Paddle 权重导出为普通 ONNX。
     @details
@@ -146,18 +147,18 @@ def infer_det_onnx_i8_route(onnx_model) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
+def build_calib_loader(data_yaml: str, imgsz: StaticInputShape, batch: int, n_batches: int):
     """!
     @brief 构建校准数据加载器。
     @details
     自包含实现：仅依赖 cv2 / numpy / pyyaml，不引入 ddyolo26 / paddle，
     在 yolo、paddle 两个 conda 环境均可运行。
-    校准输入严格复用部署语义：固定正方形居中 letterbox，且 `scaleup=False`。
+    校准输入严格复用部署语义：固定目标画布居中 letterbox，且 `scaleup=False`。
     为避免按宽高比排序后只取头部样本，先按宽高比排序，再在完整分布上
     等距抽取 `batch * n_batches` 张代表性图片。
     返回的 batch dict 中 ``img`` 为 uint8 numpy 数组 [B, 3, H, W]。
     @param data_yaml 数据集 YAML 路径。
-    @param imgsz 校准图像尺寸（正方形边长）。
+    @param imgsz 校准图像尺寸，正方形为单个边长，矩形为 `(H, W)`。
     @param batch 校准批大小。
     @param n_batches 计划使用的最大批次数。
     @return 二元组 `(batches, n_actual_batches)`，batches 是 list[dict]。
@@ -169,6 +170,7 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
 
     if batch <= 0 or n_batches <= 0:
         raise ValueError("校准 batch 和 n_batches 必须大于 0")
+    input_h, input_w = static_imgsz_hw(imgsz)
 
     img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     yaml_path = Path(data_yaml).resolve()
@@ -258,7 +260,7 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
     sampled_ratios = aspect_ratios[sample_indices]
     print(
         "[PTQ-Loader] 固定 letterbox="
-        f"{imgsz}x{imgsz}，代表性抽样={sample_count}/{len(valid_files)}，"
+        f"{input_h}x{input_w}，代表性抽样={sample_count}/{len(valid_files)}，"
         f"宽高比范围={sampled_ratios.min():.3f}..{sampled_ratios.max():.3f}"
     )
 
@@ -294,7 +296,7 @@ def build_calib_loader(data_yaml: str, imgsz: int, batch: int, n_batches: int):
             if img is None:
                 continue
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = _letterbox_rect(img, (imgsz, imgsz))
+            img = _letterbox_rect(img, (input_h, input_w))
             imgs.append(img.transpose(2, 0, 1))
         if imgs:
             batches.append({"img": np.stack(imgs)})

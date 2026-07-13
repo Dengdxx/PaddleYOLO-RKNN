@@ -7,16 +7,15 @@
 @details
 本模块服务于两条 Seg INT8 主线：
 
-- `seg_pre_dist`：YOLO26-Seg `reg_max=1`，五输出：
+- `seg_pre_dist`：YOLO26-Seg `reg_max=1`，四输出：
     raw_ltrb [1,4,N] + raw_cls_logits [1,nc,N] + mask_coeff [1,nm,N] + proto [1,nm,H,W]
-    + score_sum [1,1,N]
 - `seg_pre_dfl`：YOLOv8-Seg `reg_max=16`，五输出（转置 DFL + score-sum 快速过滤）：
     raw_dfl_transposed [1,N,4*reg_max] + raw_cls_logits [1,nc,N] + mask_coeff [1,nm,N]
     + proto [1,nm,H,W] + score_sum [1,1,N]
 
 提供三类能力：
 1. 识别当前 ONNX 属于哪条主线；
-2. 将原始 seg ONNX 改写为统一的五输出部署契约；
+2. 将原始 seg ONNX 改写为对应模型族的部署契约；
 3. 验证已准备好的 seg ONNX 的输出契约。
 """
 
@@ -26,6 +25,8 @@ from pathlib import Path
 
 import onnx
 from onnx import TensorProto, helper, numpy_helper
+
+from export.input_shape import StaticInputShape, static_imgsz_hw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +97,26 @@ def _graph_tensor_names(graph) -> set[str]:
     for o in graph.output:
         names.add(o.name)
     return names
+
+
+def _validate_static_input_shape(onnx_model: onnx.ModelProto, imgsz: StaticInputShape, input_path: str) -> None:
+    """!
+    @brief 校验分割 ONNX 的首个输入与请求的静态尺寸一致。
+    @param onnx_model 已加载的 ONNX 模型。
+    @param imgsz 请求的静态输入尺寸。
+    @param input_path 输入模型路径，用于错误信息。
+    @throw ValueError 当模型输入不是静态 NCHW 或尺寸不一致时抛出。
+    """
+    if not onnx_model.graph.input:
+        raise ValueError(f"{input_path} 不包含 ONNX 输入")
+    input_shape = _value_info_shape(onnx_model.graph.input[0])
+    if len(input_shape) != 4 or input_shape[0] != 1 or input_shape[1] != 3:
+        raise ValueError(f"分割部署要求静态 NCHW 输入 [1,3,H,W]，{input_path} 实际为 {input_shape}")
+    requested_h, requested_w = static_imgsz_hw(imgsz)
+    if input_shape[2:] != [requested_h, requested_w]:
+        raise ValueError(
+            f"请求输入尺寸 {(requested_h, requested_w)} 与 ONNX 静态输入 {tuple(input_shape[2:])} 不一致: {input_path}"
+        )
 
 
 def _lookup_tensor_shape(graph, tensor_name: str) -> list[int]:
@@ -270,9 +291,9 @@ def _is_transient_seg_predfl_outputs(outputs) -> bool:
     )
 
 
-def _is_transient_seg_predist_outputs(outputs) -> bool:
+def _is_seg_predist_outputs(outputs) -> bool:
     """!
-    @brief 判断 ONNX 公开输出是否为 `seg_pre_dist` 瞬态四输出。
+    @brief 判断 ONNX 公开输出是否为 `seg_pre_dist` 正式四输出。
     @param outputs ONNX graph output 序列。
     @return 形状符合 `[1,4,N] + cls + coeff + proto` 时返回 true。
     """
@@ -359,20 +380,23 @@ def _validate_seg_rewrite_inputs(
     model: onnx.ModelProto,
     source_outputs: list[tuple[str, list[int]]],
     input_path: str,
+    require_score_sum: bool,
 ) -> None:
     """!
     @brief 校验分割五输出图改写的输入前提。
     @details
-    RKNN INT8 量化前 ONNX 固定使用 FP32；`score_sum` 使用 opset 13+
-    的 `ReduceSum` axes 输入形式。不符合时提前报错，避免生成无效模型。
+    RKNN INT8 量化前 ONNX 固定使用 FP32。YOLOv8-Seg 的 `score_sum`
+    使用 opset 13+ 的 `ReduceSum` axes 输入形式；YOLO26-Seg
+    不增加该旁路，因此不要求 opset 13。
 
     @param model ONNX 模型。
     @param source_outputs DFL、分类、mask 系数与 proto 源张量。
     @param input_path 输入 ONNX 路径，用于错误信息。
+    @param require_score_sum 是否需要追加 `score_sum` 输出。
     @throw ValueError 当 opset 低于 13 或源张量非 FP32 时抛出。
     """
     opset = _default_onnx_opset(model)
-    if opset < 13:
+    if require_score_sum and opset < 13:
         raise ValueError(f"分割五输出改写要求 ONNX opset >= 13，{input_path} 实际为 {opset}")
 
     non_fp32 = []
@@ -392,14 +416,13 @@ def _validate_seg_rewrite_inputs(
 
 def make_seg_predist_onnx(input_path: str, output_path: str | None = None) -> str:
     """!
-    @brief 将原始 seg ONNX 裁剪为 `seg_pre_dist` 五输出。
+    @brief 将原始 YOLO26-Seg ONNX 裁剪为 `seg_pre_dist` 四输出。
     @details
     输出顺序固定为：
       - `SEG_PREDIST_LTRB_TENSOR`      raw ltrb  [1, 4, N]
       - `SEG_PREDIST_CLS_TENSOR`       cls logits [1, nc, N]
       - `SEG_PREDIST_MASK_COEFF_TENSOR` mask coeff [1, nm, N]
       - `SEG_PREDIST_PROTO_TENSOR`     proto      [1, nm, H, W]
-      - score_sum                      [1, 1, N]
 
     @param input_path 输入 ONNX 路径（原始 seg ONNX，通常为 `*_raw_*.onnx`）。
     @param output_path 输出 ONNX 路径；为空时自动追加 `_predist.onnx` 后缀。
@@ -416,7 +439,7 @@ def make_seg_predist_onnx(input_path: str, output_path: str | None = None) -> st
         print(f"[seg_pre_dist] 警告：shape_inference 失败: {exc}")
     graph = model.graph
 
-    if _is_transient_seg_predist_outputs(graph.output):
+    if _is_seg_predist_outputs(graph.output):
         source_outputs = [(output.name, _value_info_shape(output)) for output in graph.output]
     else:
         source_names = [
@@ -430,7 +453,7 @@ def make_seg_predist_onnx(input_path: str, output_path: str | None = None) -> st
             raise ValueError(f"{input_path} 中缺少 seg_pre_dist 所需张量: {sorted(missing)}")
         source_outputs = [(name, _lookup_tensor_shape(graph, name)) for name in source_names]
 
-    _validate_seg_rewrite_inputs(model, source_outputs, input_path)
+    _validate_seg_rewrite_inputs(model, source_outputs, input_path, require_score_sum=False)
     (
         (ltrb_name, ltrb_shape),
         (cls_name, cls_shape),
@@ -440,8 +463,6 @@ def make_seg_predist_onnx(input_path: str, output_path: str | None = None) -> st
             proto_shape,
         ),
     ) = source_outputs
-    sum_name, sum_shape = _append_score_sum(model, cls_name, cls_shape)
-
     _rewrite_outputs(
         model,
         [
@@ -449,7 +470,6 @@ def make_seg_predist_onnx(input_path: str, output_path: str | None = None) -> st
             (cls_name, cls_shape),
             (coeff_name, coeff_shape),
             (proto_name, proto_shape),
-            (sum_name, sum_shape),
         ],
     )
 
@@ -493,7 +513,7 @@ def make_seg_predfl_onnx(input_path: str, output_path: str | None = None) -> str
     graph = model.graph
 
     source_outputs = _resolve_seg_predfl_source_outputs(graph, input_path)
-    _validate_seg_rewrite_inputs(model, source_outputs, input_path)
+    _validate_seg_rewrite_inputs(model, source_outputs, input_path, require_score_sum=True)
     (
         (dfl_name, dfl_shape),
         (cls_name, cls_shape),
@@ -556,11 +576,9 @@ def detect_prepared_seg_route(onnx_model: onnx.ModelProto) -> str:
     @brief 识别已裁剪的 seg ONNX 所属主线。
     @details
     只认可两种可直接进入部署编译的正式契约：
-    - `seg_pre_dist`: 5 输出，output[0] = [1,4,N]
+    - `seg_pre_dist`: YOLO26-Seg 4 输出，output[0] = [1,4,N]
     - `seg_pre_dfl`: 5 输出，output[0] = [1,N,4*reg_max]，
       output[4] = score-sum [1,1,N]
-
-    四输出只允许作为导出过程中的瞬态输入，不属于正式部署契约。
 
     @param onnx_model 已加载的 ONNX 模型。
     @return `"seg_pre_dist"` 或 `"seg_pre_dfl"`。
@@ -568,8 +586,8 @@ def detect_prepared_seg_route(onnx_model: onnx.ModelProto) -> str:
     """
     outputs = onnx_model.graph.output
     n_out = len(outputs)
-    if n_out != 5:
-        raise ValueError(f"分割部署模型统一要求 5 个输出，实际 {n_out}")
+    if n_out not in (4, 5):
+        raise ValueError(f"分割部署模型要求 YOLO26 四输出或 YOLOv8 五输出，实际 {n_out}")
 
     for index, output in enumerate(outputs):
         elem_type = output.type.tensor_type.elem_type
@@ -581,8 +599,6 @@ def detect_prepared_seg_route(onnx_model: onnx.ModelProto) -> str:
     s1 = _value_info_shape(outputs[1])
     s2 = _value_info_shape(outputs[2])
     s3 = _value_info_shape(outputs[3])
-    s4 = _value_info_shape(outputs[4])
-
     if len(s0) != 3 or s0[0] != 1:
         raise ValueError(f"output[0] 必须是 3D raw box 张量，实际 {s0}")
     if len(s1) != 3 or s1[0] != 1 or s1[1] < 1 or s1[2] < 1:
@@ -594,26 +610,25 @@ def detect_prepared_seg_route(onnx_model: onnx.ModelProto) -> str:
     if s3[1] != s2[1]:
         raise ValueError(f"output[2] nm={s2[1]} 与 output[3] nm={s3[1]} 必须一致")
 
-    common_valid = all(
-        (
-            len(s4) == 3,
-            s4[0] == 1,
-            s4[1] == 1,
-            s4[2] == s1[2],
-            s1[2] == s2[2],
+    if n_out == 4 and s0[1] == 4 and s0[2] == s1[2] and s1[2] == s2[2]:
+        return "seg_pre_dist"
+    if n_out == 5:
+        s4 = _value_info_shape(outputs[4])
+        common_valid = all(
+            (
+                len(s4) == 3,
+                s4[0] == 1,
+                s4[1] == 1,
+                s4[2] == s1[2],
+                s1[2] == s2[2],
+            )
         )
-    )
-    route = None
-    if common_valid and s0[1] == 4 and s0[2] == s1[2]:
-        route = "seg_pre_dist"
-    elif common_valid and s0[2] > 4 and s0[2] % 4 == 0 and s0[1] == s1[2]:
-        route = "seg_pre_dfl"
-    if route is not None:
-        _validate_score_sum_semantics(onnx_model.graph, outputs[1].name, outputs[4].name)
-        return route
+        if common_valid and s0[2] > 4 and s0[2] % 4 == 0 and s0[1] == s1[2]:
+            _validate_score_sum_semantics(onnx_model.graph, outputs[1].name, outputs[4].name)
+            return "seg_pre_dfl"
     raise ValueError(
-        "分割部署模型需要五输出，box 为 [1,4,N] 或 [1,N,4*reg_max]，"
-        "其余为 [1,nc,N]+[1,nm,N]+[1,nm,H,W]+[1,1,N]，"
+        "YOLO26-Seg 需要 [1,4,N]+[1,nc,N]+[1,nm,N]+[1,nm,H,W] 四输出；"
+        "YOLOv8-Seg 需要 [1,N,4*reg_max]+[1,nc,N]+[1,nm,N]+[1,nm,H,W]+[1,1,N] 五输出；"
         f"实际 {n_out} 个输出，s0={s0}"
     )
 
@@ -627,7 +642,8 @@ def infer_seg_onnx_i8_route(onnx_model: onnx.ModelProto) -> str:
     """!
     @brief 从普通或已裁剪的 seg ONNX 推断 INT8 主线。
     @details
-    优先识别五输出正式契约；四输出只推断路由，由准备阶段规范化。
+    优先识别 YOLO26 四输出或 YOLOv8 五输出正式契约；
+    YOLOv8 的 DFL 四输出仅作为导出瞬态。
 
     @param onnx_model 已加载的 ONNX 模型。
     @return `"seg_pre_dist"` 或 `"seg_pre_dfl"`。
@@ -638,7 +654,7 @@ def infer_seg_onnx_i8_route(onnx_model: onnx.ModelProto) -> str:
     except ValueError:
         pass
 
-    if _is_transient_seg_predist_outputs(onnx_model.graph.output):
+    if _is_seg_predist_outputs(onnx_model.graph.output):
         return "seg_pre_dist"
     if _is_transient_seg_predfl_outputs(onnx_model.graph.output):
         return "seg_pre_dfl"
@@ -667,7 +683,7 @@ def infer_seg_onnx_i8_route(onnx_model: onnx.ModelProto) -> str:
 
 def prepare_seg_onnx_i8_input(
     weights_path: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     export_onnx_func,
 ) -> tuple[str, str, list[str]]:
     """!
@@ -676,12 +692,12 @@ def prepare_seg_onnx_i8_input(
     与 `det_onnx_routes.prepare_det_onnx_i8_input` 对称：
       - 输入可为 `.pdparams / onnx`；
       - Paddle 权重通过 `export_onnx_func` 自动导出普通 seg ONNX；
-      - 五输出 `seg_pre_dist / seg_pre_dfl` 直接返回；
-      - 瞬态四输出自动规范化为带 score-sum 的五输出；
+      - YOLO26 四输出 `seg_pre_dist` 与 YOLOv8 五输出 `seg_pre_dfl` 直接返回；
+      - YOLOv8 瞬态四输出自动规范化为带 score-sum 的五输出；
       - 其他普通 ONNX 按 route 调用对应图改写函数。
 
     @param weights_path 用户输入权重路径，可为 `.pdparams / onnx`。
-    @param imgsz 导出普通 ONNX 时使用的输入尺寸。
+    @param imgsz 导出普通 ONNX 时使用的静态输入尺寸。
     @param export_onnx_func 普通 ONNX 导出函数，签名为 `(weights_path, imgsz) -> onnx_path`。
     @return 三元组 `(route, prepared_onnx_path, cleanup_paths)`：
             - `route`：`"seg_pre_dist"` 或 `"seg_pre_dfl"`；
@@ -700,6 +716,7 @@ def prepare_seg_onnx_i8_input(
         cleanup_paths.append(source_path)
 
     onnx_model = onnx.load(source_path)
+    _validate_static_input_shape(onnx_model, imgsz, source_path)
     try:
         route = detect_prepared_seg_route(onnx_model)
     except ValueError:

@@ -256,7 +256,7 @@ class Exporter:
         if rknn and getattr(model, "task", "detect") == "segment":
             raise ValueError(
                 "公共 YOLO.export(format='rknn') 不直接编译分割模型；"
-                "请使用 export/export_seg_rknn_i8.py，先规范化为统一五输出再编译 RKNN。"
+                "请使用 export/export_seg_rknn_i8.py，先生成对应模型族的部署输出再编译 RKNN。"
             )
         dla = None
         if engine and self.args.device is None:
@@ -279,9 +279,11 @@ class Exporter:
         if hasattr(model, "end2end"):
             if self.args.end2end is not None:
                 model.end2end = self.args.end2end
-            if rknn:
-                model.end2end = False
-                LOGGER.warning(f"{fmt.upper()} 导出不支持 end2end 模型，已关闭 end2end 分支。")
+            if rknn and model.end2end:
+                raise ValueError(
+                    "公共 YOLO.export(format='rknn') 不直接编译 YOLO26 end2end 模型；"
+                    "请使用 export/export_det_rknn_i8.py 生成 pre_dist NMS-free 部署模型。"
+                )
         if self.args.half and self.args.int8:
             LOGGER.warning("half=True 与 int8=True 互斥，已设置 half=False。")
             self.args.half = False
@@ -327,7 +329,7 @@ class Exporter:
                 m.format = self.args.format
                 if getattr(self.args, "dual_raw", False) and isinstance(m, Detect):
                     # 原始输出模式：返回 head_dict 的 boxes/scores（分割头另含 mask_coeff/proto）。
-                    # 分割四输出仅供后续导出步骤规范化为五输出。
+                    # YOLO26-Seg 四输出为正式契约；YOLOv8-Seg 四输出会追加 score_sum。
                     # end2end 模型自动走 one2one head，非 end2end 走 one2many（cv2/cv3）。
                     m.export_dual_raw = True
                 if getattr(self.args, "export_raw_one2one", False) and isinstance(m, Detect):

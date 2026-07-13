@@ -3,17 +3,17 @@
 
 #pragma once
 
+#include "rknn_api.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
-#include "rknn_api.h"
-
 namespace paddleyolo_rknn::postprocess {
 
-/** @brief 五输出张量编号。 */
-enum class FiveOutputTensor : std::uint8_t {
+/** @brief 分割模型 full-IO 张量编号。 */
+enum class FullIoTensor : std::uint8_t {
   kBox = 0,
   kClass = 1,
   kMaskCoeff = 2,
@@ -33,39 +33,38 @@ struct Nc1hwc2Int8View {
 };
 
 /** @brief 单帧按需同步统计。 */
-struct FiveOutputSyncStats {
-  std::uint8_t ready_mask{0};  ///< 已同步并准备完成的输出位图。
-  std::size_t native_bytes{0}; ///< 已同步的原生 DMA 缓冲区字节数。
-  double sync_ms{0.0};         ///< DMA 同步与必要布局恢复耗时。
+struct FullIoSyncStats {
+  std::uint8_t ready_mask{0};   ///< 已同步并准备完成的输出位图。
+  std::size_t native_bytes{0};  ///< 已同步的原生 DMA 缓冲区字节数。
+  double sync_ms{0.0};          ///< DMA 同步与必要布局恢复耗时。
 };
 
 /**
- * @brief 五输出 RKNN full-IO zero-copy 绑定与按需同步运行时。
- * @details 输入和五个输出统一使用 `rknn_set_io_mem()`；输出仅在 CPU 后处理
- * 真正需要时执行 `RKNN_MEMORY_SYNC_FROM_DEVICE`。
+ * @brief RKNN 分割模型 full-IO zero-copy 绑定与按需同步运行时。
+ * @details 输入和四/五个输出统一使用 `rknn_set_io_mem()`；输出仅在
+ * CPU 后处理真正需要时执行 `RKNN_MEMORY_SYNC_FROM_DEVICE`。
  */
-class FiveOutputRuntime {
-public:
+class FullIoRuntime {
+ public:
   /** @brief 构造空运行时。 */
-  FiveOutputRuntime() = default;
+  FullIoRuntime() = default;
 
   /** @brief 析构并释放全部 RKNN tensor memory。 */
-  ~FiveOutputRuntime();
+  ~FullIoRuntime();
 
-  FiveOutputRuntime(const FiveOutputRuntime &) = delete;
-  FiveOutputRuntime &operator=(const FiveOutputRuntime &) = delete;
+  FullIoRuntime(const FullIoRuntime &) = delete;
+  FullIoRuntime &operator=(const FullIoRuntime &) = delete;
 
   /**
-   * @brief 创建并绑定输入与五个原生输出缓冲区。
+   * @brief 创建并绑定输入与四/五个原生输出缓冲区。
    * @param context 已初始化的 RKNN context。
    * @param logical_input 逻辑输入属性。
-   * @param logical_outputs 五个逻辑输出属性。
-   * @param output_count 输出数量，必须为 5。
+   * @param logical_outputs 逻辑输出属性。
+   * @param output_count 输出数量，YOLO26-Seg 为 4，YOLOv8-Seg 为 5。
    * @return 成功返回 true。
    */
   bool Initialize(rknn_context context, const rknn_tensor_attr &logical_input,
-                  const rknn_tensor_attr *logical_outputs,
-                  std::uint32_t output_count);
+                  const rknn_tensor_attr *logical_outputs, std::uint32_t output_count);
 
   /**
    * @brief 将固定评测输入复制到 zero-copy 输入缓冲区。
@@ -86,27 +85,35 @@ public:
    * @param tensor 输出编号。
    * @return RKNN 错误码；布局不支持时返回负值。
    */
-  int Prepare(FiveOutputTensor tensor);
+  int Prepare(FullIoTensor tensor);
 
   /** @brief 开始新帧并清空 ready mask/同步统计。 */
   void BeginFrame() noexcept;
 
-  /** @brief 获取五个后处理输出描述。 */
-  rknn_output *Outputs() noexcept { return outputs_.data(); }
+  /** @brief 获取后处理输出描述。 */
+  rknn_output *Outputs() noexcept {
+    return outputs_.data();
+  }
 
   /** @brief 获取原生 proto 视图。 */
-  const Nc1hwc2Int8View &ProtoView() const noexcept { return proto_view_; }
+  const Nc1hwc2Int8View &ProtoView() const noexcept {
+    return proto_view_;
+  }
 
   /** @brief 获取当前帧同步统计。 */
-  const FiveOutputSyncStats &Stats() const noexcept { return stats_; }
+  const FullIoSyncStats &Stats() const noexcept {
+    return stats_;
+  }
 
   /** @brief 查询运行时是否完成初始化。 */
-  bool IsInitialized() const noexcept { return initialized_; }
+  bool IsInitialized() const noexcept {
+    return initialized_;
+  }
 
   /** @brief 释放全部绑定资源。 */
   void Release() noexcept;
 
-private:
+ private:
   bool PrepareLogicalOutput(std::size_t index);
   bool BuildProtoView();
 
@@ -120,8 +127,9 @@ private:
   std::array<rknn_output, 5> outputs_{};
   std::array<std::vector<std::uint8_t>, 5> logical_buffers_{};
   Nc1hwc2Int8View proto_view_{};
-  FiveOutputSyncStats stats_{};
+  FullIoSyncStats stats_{};
+  std::size_t output_count_{0};
   bool initialized_{false};
 };
 
-} // namespace paddleyolo_rknn::postprocess
+}  // namespace paddleyolo_rknn::postprocess

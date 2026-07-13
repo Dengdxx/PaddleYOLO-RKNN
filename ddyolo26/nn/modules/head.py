@@ -499,7 +499,7 @@ class Segment(Detect):
         preds = self.forward_head(x, **head_dict)
         proto = self.proto(x[0])
         if self.export_dual_raw:
-            # 四输出仅作为导出瞬态张量，后续统一追加 score_sum 形成五输出。
+            # YOLO26-Seg 四输出为正式 NMS-free 契约；YOLOv8-Seg 由导出路由追加 score_sum。
             #   boxes        [B, 4*reg_max, A]
             #   scores       [B, nc, A]                (未 sigmoid)
             #   mask_coeff   [B, nm, A]

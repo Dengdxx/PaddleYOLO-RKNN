@@ -175,10 +175,10 @@ def route_onnx_provenance(source: Path, route: str, imgsz: int, python_exe: str)
 
 def is_prepared_seg_onnx(path: Path, python_exe: str, expected_route: str) -> bool:
     """!
-    @brief 检查已有分割 ONNX 是否满足统一五输出部署契约。
+    @brief 检查已有分割 ONNX 是否满足对应模型族的部署契约。
     @param path 待检查的 ONNX 路径。
     @param python_exe 提供 ONNX 依赖的 Python 可执行文件。
-    @return 严格满足 `seg_pre_dist / seg_pre_dfl` 五输出契约时返回 true。
+    @return 严格满足 YOLO26 四输出或 YOLOv8 五输出契约时返回 true。
     """
     code = (
         "import sys, onnx; "
@@ -198,7 +198,7 @@ def is_prepared_seg_onnx(path: Path, python_exe: str, expected_route: str) -> bo
         return True
     detail = result.stderr.strip().splitlines()
     reason = detail[-1] if detail else "输出契约检查失败"
-    log(f"已有分割 ONNX 不是五输出，将重建: {path.name} ({reason})")
+    log(f"已有分割 ONNX 不满足 route 契约，将重建: {path.name} ({reason})")
     return False
 
 
@@ -374,7 +374,7 @@ def step_int8_onnx_seg(
     calib_images: int,
 ) -> Path:
     """!
-    @brief segmentation 模型生成统一五输出的 INT8 ONNX。
+    @brief segmentation 模型生成对应模型族契约的 INT8 ONNX。
     """
     target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.onnx"
     provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "onnx")
