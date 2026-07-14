@@ -232,6 +232,26 @@ results = model.predict(
 
 > `reg_max=1` 的 YOLO26 检测模型中，`dfl` 参数不生效；YOLOv8 正常使用 DFL。
 
+### 矩形训练语义
+
+训练和标准验证与 Ultralytics 保持一致：`imgsz` 是单个最长边尺寸，不能用
+`imgsz=[480,640]` 指定所有 batch 的固定形状。启用 `rect=True` 后，数据集按宽高比
+排序，并为每个 batch 选择各自的 stride 对齐矩形；例如全部为 4:3 横图、
+`imgsz=640`、训练阶段 `pad=0.0` 时，batch 可自然得到 `480x640`。
+
+```bash
+yolo train model=yolo26n-seg.pdparams data=mygo.yaml imgsz=640 rect=True
+```
+
+`rect=True` 会按 Ultralytics 规则关闭 Mosaic、MixUp 和 CutMix，并在 batch shape
+不完全相同时关闭 DataLoader shuffle；多 GPU 训练会回退为 `rect=False`。如需 Mosaic，
+应使用默认 `rect=False` 的方形训练。标准验证默认采用 `rect=True` 和 `pad=0.5`，因此
+4:3 数据在 `imgsz=640` 时可能得到 `512x672`，这不等同于部署使用的固定
+`480x640` 输入。
+
+固定静态矩形只用于 predict/export、量化、部署评测和 RKNN/ONNX 推理，例如
+`imgsz=480x640`；它不改变上述训练语义。
+
 ## 训练产物
 
 ```text

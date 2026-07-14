@@ -94,6 +94,10 @@ model.train(
 
 训练完成后，权重位于 `runs/segment/exp/weights/best.pdparams`。
 
+> `train/val` 继续使用标量 `imgsz=640`。`predict/export`、ONNX/RKNN
+> 量化和静态评测支持固定矩形，可写为 `--imgsz 480x640` 或
+> `--imgsz 480 640`；顺序恒为 `height,width`。
+
 2. 在 Ubuntu/WSL 的 `pdrk` 环境导出 RKNN INT8 使用的 route FP32 ONNX：
 
 ```bash
@@ -101,25 +105,26 @@ conda activate pdrk
 python export/export_seg_onnx_i8.py \
   --weights runs/segment/exp/weights/best.pdparams \
   --data data/your-seg.yaml \
-  --imgsz 640 \
+  --imgsz 480x640 \
   --skip-quant
 ```
 
-产物位于 `runs/segment/exp/weights/best_paddle_seg_predfl_fp32_640.onnx`。
+产物位于 `runs/segment/exp/weights/best_paddle_seg_predfl_fp32_480x640.onnx`。
 
 3. 在 Ubuntu/WSL 的 `rknn` 环境量化并编译 RKNN：
 
 ```bash
 conda activate rknn
 python export/export_seg_rknn_i8.py \
-  --weights runs/segment/exp/weights/best_paddle_seg_predfl_fp32_640.onnx \
+  --weights runs/segment/exp/weights/best_paddle_seg_predfl_fp32_480x640.onnx \
   --data data/your-seg.yaml \
-  --imgsz 640 \
+  --imgsz 480x640 \
   --calib-images 50 \
   --algorithm normal
 ```
 
-产物位于 `runs/segment/exp/weights/best_paddle_seg_predfl_int8_640.rknn`。
+产物位于 `runs/segment/exp/weights/best_paddle_seg_predfl_int8_480x640.rknn`，
+并生成绑定模型 SHA-256 的 `.rknn.model.yaml`。
 
 更多数据集格式、训练参数、验证与推理说明见 [训练与评估](docs/training.md)。
 

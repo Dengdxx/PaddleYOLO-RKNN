@@ -27,6 +27,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 from export.input_shape import StaticInputShape, static_imgsz_hw
+from export.det_onnx_routes import DEFAULT_STRIDES, expected_anchor_count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,6 +634,50 @@ def detect_prepared_seg_route(onnx_model: onnx.ModelProto) -> str:
     )
 
 
+def validate_seg_deployment_contract(
+    onnx_model: onnx.ModelProto,
+    imgsz: StaticInputShape,
+    route: str,
+    input_path: str,
+    strides: tuple[int, ...] = DEFAULT_STRIDES,
+    proto_stride: int = 4,
+) -> None:
+    """!
+    @brief 校验分割 ONNX 的输入、anchor 和 proto 静态几何契约。
+    @param onnx_model 已加载的 ONNX 模型。
+    @param imgsz 请求的静态输入尺寸。
+    @param route 分割部署路由，`seg_pre_dist` 或 `seg_pre_dfl`。
+    @param input_path 模型路径，用于错误信息。
+    @param strides 检测头特征层步幅。
+    @param proto_stride proto 相对模型输入的下采样倍数。
+    @throw ValueError 任一静态契约不一致时抛出。
+    """
+    _validate_static_input_shape(onnx_model, imgsz, input_path)
+    detected_route = detect_prepared_seg_route(onnx_model)
+    if detected_route != route:
+        raise ValueError(f"分割 route 不一致：期望 {route}，实际 {detected_route}: {input_path}")
+
+    input_h, input_w = static_imgsz_hw(imgsz)
+    anchors = expected_anchor_count(imgsz, strides)
+    outputs = onnx_model.graph.output
+    cls_shape = _value_info_shape(outputs[1])
+    coeff_shape = _value_info_shape(outputs[2])
+    proto_shape = _value_info_shape(outputs[3])
+    box_shape = _value_info_shape(outputs[0])
+    box_anchors = box_shape[1] if route == "seg_pre_dfl" else box_shape[2]
+    if box_anchors != anchors or cls_shape[2] != anchors or coeff_shape[2] != anchors:
+        raise ValueError(
+            f"{route} anchor 数不一致：输出={box_anchors}/{cls_shape[2]}/{coeff_shape[2]}，"
+            f"输入={input_h}x{input_w} 按 strides={list(strides)} 应为 {anchors}"
+        )
+    expected_proto = [1, coeff_shape[1], input_h // proto_stride, input_w // proto_stride]
+    if proto_shape != expected_proto:
+        raise ValueError(
+            f"{route} proto 形状不一致：输出={proto_shape}，"
+            f"输入={input_h}x{input_w} 按 proto_stride={proto_stride} 应为 {expected_proto}"
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  一步式输入准备（与 det_onnx_routes.prepare_det_onnx_i8_input 对称）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,6 +768,7 @@ def prepare_seg_onnx_i8_input(
         route = None
 
     if route is not None:
+        validate_seg_deployment_contract(onnx_model, imgsz, route, source_path)
         return route, source_path, cleanup_paths
 
     route = infer_seg_onnx_i8_route(onnx_model)
@@ -731,5 +777,6 @@ def prepare_seg_onnx_i8_input(
         prepared = make_seg_predist_onnx(source_path, str(tmp_dir / (Path(source_path).stem + "_predist.onnx")))
     else:
         prepared = make_seg_predfl_onnx(source_path, str(tmp_dir / (Path(source_path).stem + "_predfl.onnx")))
+    validate_seg_deployment_contract(onnx.load(prepared), imgsz, route, prepared)
     cleanup_paths.append(str(tmp_dir))
     return route, prepared, cleanup_paths

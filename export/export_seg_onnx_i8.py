@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weights", required=True, help="输入权重路径（.pdparams / onnx）")
     p.add_argument("--route", choices=["seg_predist", "seg_predfl"], help="要求的部署 route；不匹配时拒绝导出")
     p.add_argument("--data", required=True, help="校准数据集 YAML")
-    p.add_argument("--imgsz", nargs="+", type=int, default=[640], metavar="SIZE", help="输入尺寸：SIZE 或 H W")
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--output", default="", help="输出 INT8 ONNX 路径；默认与输入模型同目录")
     p.add_argument("--prepared-output", default="", help="额外保存量化前的 route FP32 ONNX；默认与输入模型同目录")
     p.add_argument("--skip-quant", action="store_true", help="只导出 route FP32 ONNX，不执行 ORT INT8 量化")
@@ -110,7 +110,17 @@ def main() -> int:
             if Path(prepared_path).resolve() != prepared_output.resolve():
                 shutil.copy2(prepared_path, prepared_output)
             size_mb = os.path.getsize(prepared_output) / 1024 / 1024
+            from export.model_manifest import write_model_manifest
+
+            prepared_manifest = write_model_manifest(
+                prepared_output,
+                prepared_output,
+                public_route,
+                imgsz,
+                data_yaml=args.data,
+            )
             print(f"[EXPORT-SEG-FP32-ROUTE-ONNX] 完成: {prepared_output} ({size_mb:.1f} MB)")
+            print(f"[EXPORT-SEG-FP32-ROUTE-ONNX] 清单: {prepared_manifest}")
         if args.skip_quant:
             return 0
 
@@ -125,9 +135,7 @@ def main() -> int:
 
         from quant.quantize import build_calib_loader
 
-        output = (
-            Path(args.output).resolve() if args.output else default_int8_output_path(weights_path, route, imgsz)
-        )
+        output = Path(args.output).resolve() if args.output else default_int8_output_path(weights_path, route, imgsz)
         output.parent.mkdir(parents=True, exist_ok=True)
         loader, n_batches = build_calib_loader(
             str(Path(args.data).resolve()), imgsz, batch=1, n_batches=args.calib_batches
@@ -178,8 +186,15 @@ def main() -> int:
                 per_channel=True,
             )
 
+        from export.seg_onnx_routes import validate_seg_deployment_contract
+
+        validate_seg_deployment_contract(_onnx.load(output), imgsz, route, str(output))
         size_mb = os.path.getsize(output) / 1024 / 1024
+        from export.model_manifest import write_model_manifest
+
+        manifest_path = write_model_manifest(output, prepared_path, public_route, imgsz, data_yaml=args.data)
         print(f"[EXPORT-SEG-INT8-ONNX] 完成: {output} ({size_mb:.1f} MB)")
+        print(f"[EXPORT-SEG-INT8-ONNX] 清单: {manifest_path}")
         return 0
     finally:
         for p in cleanup:

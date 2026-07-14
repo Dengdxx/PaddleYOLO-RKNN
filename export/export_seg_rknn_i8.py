@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", required=True, help="校准数据集 YAML")
     p.add_argument("--output", default=None, help="输出 .rknn 路径")
     p.add_argument("--target", default="rk3588", choices=["rk3588", "rk3588s", "rk3576", "rk3562"])
-    p.add_argument("--imgsz", nargs="+", type=int, default=[640], metavar="SIZE", help="输入尺寸：SIZE 或 H W")
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--calib-images", type=int, default=50)
     p.add_argument("--calib-offset", type=int, default=0, help="校准图片起始偏移，用于避免与评测集重叠")
     p.add_argument("--algorithm", default="auto", choices=["auto", "normal", "mmse", "kl_divergence"])
@@ -212,8 +212,12 @@ def main() -> int:
                 args.optimization_level,
                 calib_offset=args.calib_offset,
             )
+        from export.model_manifest import write_model_manifest
+
+        manifest_path = write_model_manifest(output_path, fixed_onnx, public_route, imgsz, data_yaml=args.data)
         size_mb = Path(output_path).stat().st_size / 1024 / 1024
         print(f"[SEG-RKNN-I8] 完成: {output_path} ({size_mb:.1f} MB)")
+        print(f"[SEG-RKNN-I8] 清单: {manifest_path}")
         return 0
     finally:
         _cleanup_paths(cleanup_paths)

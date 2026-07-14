@@ -25,15 +25,20 @@ from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("GLOG_minloglevel", "2")
 warnings.filterwarnings("ignore", "No ccache found")
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork.*")
 
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="导出 YOLO 到 RKNN（通用 FP16 入口）")
     p.add_argument("--weights", required=True, help="ONNX 或 .pdparams 模型路径")
+    p.add_argument("--data", required=True, help="数据集 YAML 或分类目录，用于生成权威类别名清单")
     p.add_argument("--output", default=None, help="输出 .rknn 路径（默认：自动）")
     p.add_argument(
         "--target",
@@ -41,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         choices=["rk3588", "rk3588s", "rk3576", "rk3562"],
         help="目标 NPU 平台（默认：rk3588）",
     )
-    p.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸")
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入图像尺寸：SIZE、HxW 或 H W")
     p.add_argument(
         "--quantize",
         default="fp16",
@@ -61,14 +66,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def default_output_path(weights_path: str, imgsz: int) -> str:
+def default_output_path(weights_path: str, imgsz: StaticInputShape) -> str:
     """生成默认 FP16 RKNN 输出路径，默认写到输入模型同目录。"""
     p = Path(weights_path)
     stem = p.stem[:-7] if p.stem.endswith("_paddle") else p.stem
     if "_fp32_" in stem:
         stem = stem.split("_fp32_", 1)[0]
     base = stem.split("_paddle_", 1)[0]
-    return str((p.parent / f"{base}_paddle_fp16_{imgsz}.rknn").resolve())
+    return str((p.parent / f"{base}_paddle_fp16_{format_static_imgsz(imgsz)}.rknn").resolve())
 
 
 def configure_rknn_e2e_export_mode(model, e2e_mode: str) -> bool:
@@ -85,7 +90,7 @@ def configure_rknn_e2e_export_mode(model, e2e_mode: str) -> bool:
     return False
 
 
-def ensure_onnx(weights_path: str, imgsz: int, e2e_mode: str = "postprocess") -> str:
+def ensure_onnx(weights_path: str, imgsz: StaticInputShape, e2e_mode: str = "postprocess") -> str:
     p = Path(weights_path)
     if p.suffix == ".onnx":
         return str(p)
@@ -254,11 +259,11 @@ def collect_calib_images(data_yaml: str, count: int, offset: int = 0) -> list[st
     return images
 
 
-def _save_calib_dataset(data_yaml: str, imgsz: int, count: int, offset: int = 0) -> str:
-    """! 收集校准图片并落盘为 RGB 副本，返回 dataset.txt 路径。
+def _save_calib_dataset(data_yaml: str, imgsz, count: int, offset: int = 0) -> str:
+    """! 收集校准图片并落盘为固定尺寸 RGB letterbox 副本。
 
     @param data_yaml 数据集 YAML 路径。
-    @param imgsz 校准输入尺寸（未使用，保留供调用方一致性）。
+    @param imgsz 校准输入尺寸，按 `(height, width)` 语义解析。
     @param count 校准图片数量。
     @param offset 起始偏移量，跳过前 N 张图片，用于避免与评测集重叠。
     @return dataset.txt 路径。
@@ -266,12 +271,11 @@ def _save_calib_dataset(data_yaml: str, imgsz: int, count: int, offset: int = 0)
     RKNN INT8 校准必须喂 RGB；否则 quantize scale 与权重通道错位。详见
     `tools.eval.backend_utils.make_rgb_calib_dataset` 注释。
     """
-    del imgsz
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from tools.eval.backend_utils import make_rgb_calib_dataset
 
     images = collect_calib_images(data_yaml, count, offset)
-    return make_rgb_calib_dataset(images, prefix="rknn_calib_")
+    return make_rgb_calib_dataset(images, imgsz, prefix="rknn_calib_")
 
 
 def call_rknn_build(rknn, **kwargs):
@@ -325,6 +329,7 @@ def build_fp16_rknn(
 def main() -> int:
     """保留通用 FP16 RKNN 导出入口，并拒绝已拆分到专用脚本的 INT8 路线。"""
     args = parse_args()
+    imgsz = normalize_static_imgsz(args.imgsz)
 
     if args.quantize != "fp16":
         raise SystemExit(
@@ -332,22 +337,21 @@ def main() -> int:
             "YOLO26 检测请使用 pre_dist 专用导出链路；DFL 模型请使用 pre_dfl 专用导出链路。"
         )
 
-    onnx_path = ensure_onnx(args.weights, args.imgsz, args.e2e_mode)
+    onnx_path = ensure_onnx(args.weights, imgsz, args.e2e_mode)
     import onnx
 
     model = onnx.load(onnx_path)
     output_ranks = [len(output.type.tensor_type.shape.dim) for output in model.graph.output]
     if 4 in output_ranks:
         raise SystemExit(
-            "通用 FP16 入口不支持分割模型；请使用 export_seg_rknn_i8.py，"
-            "生成 YOLO26 四输出或 YOLOv8 五输出部署产物。"
+            "通用 FP16 入口不支持分割模型；请使用 export_seg_rknn_i8.py，生成 YOLO26 四输出或 YOLOv8 五输出部署产物。"
         )
     prepared_onnx = prepare_onnx(onnx_path, fix_paddle=not args.no_fix)
 
     if args.output:
         out_path = args.output
     else:
-        out_path = default_output_path(args.weights, args.imgsz)
+        out_path = default_output_path(args.weights, imgsz)
 
     print(f"[INFO] 开始导出 FP16 RKNN: {prepared_onnx} -> {out_path}")
     build_fp16_rknn(
@@ -358,7 +362,12 @@ def main() -> int:
         compress_weight=args.compress_weight,
         model_pruning=args.model_pruning,
     )
+    from export.model_manifest import infer_native_output_route, write_model_manifest
+
+    output_route = infer_native_output_route(prepared_onnx)
+    manifest_path = write_model_manifest(out_path, prepared_onnx, output_route, imgsz, data_yaml=args.data)
     print(f"[INFO] RKNN 已导出: {out_path}")
+    print(f"[INFO] 模型清单: {manifest_path}")
     return 0
 
 

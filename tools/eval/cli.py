@@ -60,10 +60,12 @@ from pathlib import Path
 
 import numpy as np
 
+from image_shape import format_imgsz, validate_imgsz_stride
+
 try:
-    from .backend_utils import prepare_onnx_input, prepare_rknn_input
+    from .backend_utils import LetterboxTransform, letterbox_image, prepare_onnx_input, prepare_rknn_input
 except ImportError:  # pragma: no cover - 支持直接执行 `python tools/eval/cli.py`
-    from backend_utils import prepare_onnx_input, prepare_rknn_input
+    from backend_utils import LetterboxTransform, letterbox_image, prepare_onnx_input, prepare_rknn_input
 
 # ── COCO 类别 ID 映射（仅数据集为 COCO 时使用）─────────────
 COCO_IDS = [
@@ -176,7 +178,11 @@ def parse_args():
     p.add_argument("--model", required=True, help="模型路径或 glob 通配符（如 '*.rknn'）")
     p.add_argument("--data", required=True, help="数据集 YAML 路径（含 val、nc、names）")
     p.add_argument(
-        "--imgsz", default=None, help="输入图像尺寸，支持 640、640x640、480,640（默认：从模型文件名自动推断）"
+        "--imgsz",
+        nargs="+",
+        default=None,
+        metavar="SIZE",
+        help="输入尺寸：SIZE、HxW 或 H W；默认从 sidecar/模型属性推断",
     )
     p.add_argument("--conf", type=float, default=0.001, help="置信度阈值（默认 0.001，用于 mAP 评估）")
     p.add_argument("--iou", type=float, default=0.7, help="NMS IoU 阈值（默认 0.7，与基准验证口径对齐）")
@@ -623,7 +629,7 @@ def _polygons2masks_overlap(imgsz, segments, downsample_ratio=1):
 
 
 def load_yolo_segment_ground_truth_eval(
-    label_path, img_w, img_h, imgsz, scale, pad_w, pad_h, mask_downsample_ratio=4, overlap_mask=True, nc=None
+    label_path, img_w, img_h, imgsz, transform, mask_downsample_ratio=4, overlap_mask=True, nc=None
 ):
     """按基准验证口径加载分割 GT。
 
@@ -672,9 +678,7 @@ def load_yolo_segment_ground_truth_eval(
 
             box_lb = _letterbox_boxes(
                 np.array([[x1, y1, x2, y2]], dtype=np.float32),
-                scale,
-                pad_w,
-                pad_h,
+                transform,
                 imgsz,
             )[0]
             gt_boxes.append(box_lb)
@@ -690,8 +694,8 @@ def load_yolo_segment_ground_truth_eval(
         segments_lb = []
         for segment in segments_norm:
             segment_lb = np.empty_like(segment, dtype=np.float32)
-            segment_lb[:, 0] = segment[:, 0] * img_w * scale + pad_w
-            segment_lb[:, 1] = segment[:, 1] * img_h * scale + pad_h
+            segment_lb[:, 0] = segment[:, 0] * img_w * transform.scale_x + transform.pad_x
+            segment_lb[:, 1] = segment[:, 1] * img_h * transform.scale_y + transform.pad_y
             segments_lb.append(segment_lb)
 
         if overlap_mask:
@@ -726,45 +730,67 @@ def load_yolo_segment_ground_truth_eval(
 
 
 def infer_input_size(model_path):
-    """从模型文件名推断输入尺寸。例如 '_384.rknn' -> 384，无匹配则默认 640。"""
-    m = re.search(r"_(\d{3,4})\.(rknn|onnx)$", os.path.basename(model_path))
-    return int(m.group(1)) if m else 640
+    """!
+    @brief 从 sidecar、ONNX 属性或文件名依次推断静态输入尺寸。
+    @param model_path ONNX/RKNN 模型路径。
+    @return `(height, width)`；无任何可信信息时回退到 `(640,640)`。
+    """
+    path = Path(model_path)
+    manifest_path = path.with_suffix(path.suffix + ".model.yaml")
+    if manifest_path.is_file():
+        import yaml
+
+        payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+        expected_hash = payload.get("model_sha256")
+        if expected_hash:
+            import hashlib
+
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            actual_hash = digest.hexdigest()
+            if actual_hash != expected_hash:
+                raise ValueError(f"模型清单哈希不匹配: expected={expected_hash}, actual={actual_hash}, model={path}")
+        if "input_shape" in payload:
+            return tuple(validate_imgsz_stride(payload["input_shape"], 32))
+
+    if path.suffix.lower() == ".onnx" and path.is_file():
+        import onnx
+
+        model = onnx.load(path, load_external_data=False)
+        dims = [dim.dim_value for dim in model.graph.input[0].type.tensor_type.shape.dim]
+        if len(dims) == 4 and all(dimension > 0 for dimension in dims):
+            return tuple(validate_imgsz_stride((int(dims[2]), int(dims[3])), 32))
+
+    match = re.search(r"_(\d{2,4})x(\d{2,4})\.(rknn|onnx)$", path.name, re.IGNORECASE)
+    if match:
+        return tuple(validate_imgsz_stride((int(match.group(1)), int(match.group(2))), 32))
+    match = re.search(r"_(\d{2,4})\.(rknn|onnx)$", path.name, re.IGNORECASE)
+    size = int(match.group(1)) if match else 640
+    return tuple(validate_imgsz_stride((size, size), 32))
 
 
 def parse_input_shape(value):
     """解析输入尺寸为 (height, width)。"""
     if value is None:
         return None
-    if isinstance(value, tuple):
-        if len(value) != 2:
-            raise ValueError(f"输入尺寸 tuple 长度应为 2，实际 {value}")
-        h, w = value
-        return int(h), int(w)
-    if isinstance(value, int):
-        return value, value
-
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    for sep in ("x", ","):
-        if sep in text:
-            parts = [p.strip() for p in text.split(sep)]
-            if len(parts) != 2:
-                raise ValueError(f"输入尺寸格式错误: {value}")
-            h, w = (int(parts[0]), int(parts[1]))
-            if h <= 0 or w <= 0:
-                raise ValueError(f"输入尺寸必须为正数: {value}")
-            return h, w
-    size = int(text)
-    if size <= 0:
-        raise ValueError(f"输入尺寸必须为正数: {value}")
-    return size, size
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            value = value[0]
+        elif len(value) == 2:
+            value = [int(value[0]), int(value[1])]
+        else:
+            raise ValueError(f"输入尺寸只接受一个边长或 H W，实际为 {value}")
+    if isinstance(value, str) and "," in value and "x" not in value.lower():
+        value = [int(part.strip()) for part in value.split(",")]
+    shape = validate_imgsz_stride(value, 32)
+    return shape.height, shape.width
 
 
 def format_input_shape(input_shape):
     """将 (height, width) 格式化为短字符串。"""
-    h, w = parse_input_shape(input_shape)
-    return str(h) if h == w else f"{h}x{w}"
+    return format_imgsz(input_shape)
 
 
 def letterbox(img, new_shape=640):
@@ -779,21 +805,7 @@ def letterbox(img, new_shape=640):
     返回:
         (padded_img, scale, (pad_w, pad_h))：填充后图片、缩放比例、填充偏移。
     """
-    import cv2
-
-    new_h, new_w = parse_input_shape(new_shape)
-    h, w = img.shape[:2]
-    scale = min(new_h / h, new_w / w)
-    scale = min(scale, 1.0)
-    nw, nh = round(w * scale), round(h * scale)
-    resized = cv2.resize(img, (nw, nh)) if (w, h) != (nw, nh) else img
-    canvas = np.full((new_h, new_w, 3), 114, dtype=np.uint8)
-    pad_w = (new_w - nw) / 2
-    pad_h = (new_h - nh) / 2
-    top = round(pad_h - 0.1)
-    left = round(pad_w - 0.1)
-    canvas[top : top + nh, left : left + nw] = resized
-    return canvas, scale, (left, top)
+    return letterbox_image(img, new_shape, pad_value=114, scaleup=False)
 
 
 def sigmoid(x):
@@ -932,10 +944,7 @@ def _validate_seg_outputs(outputs, output_format, expected_anchors=None):
         if not np.isfinite(score_sum).all():
             raise ValueError("seg_pre_dfl output[4] score_sum 存在非有限值")
         if not (
-            raw_box.ndim == 3
-            and raw_box.shape[1] == anchors
-            and raw_box.shape[2] > 4
-            and raw_box.shape[2] % 4 == 0
+            raw_box.ndim == 3 and raw_box.shape[1] == anchors and raw_box.shape[2] > 4 and raw_box.shape[2] % 4 == 0
         ):
             raise ValueError(f"seg_pre_dfl output[0] 必须为 [1,N,4*reg_max]，实际 {raw_box.shape}")
 
@@ -1125,9 +1134,7 @@ def _xywh_to_xyxy(boxes):
     return xyxy
 
 
-def _segment_class_aware_nms(
-    boxes, scores, classes, coeffs, proto, max_det, iou_thresh
-):
+def _segment_class_aware_nms(boxes, scores, classes, coeffs, proto, max_det, iou_thresh):
     """对已选定的分割候选执行 class-aware NMS，并保持 coeff 行对齐。"""
     if len(scores) == 0:
         return _empty_seg_result(proto)
@@ -1187,9 +1194,7 @@ def _segment_multilabel_nms(prediction, proto, nc, conf_thresh, max_det, iou_thr
     )
 
 
-def _segment_best_class_nms(
-    prediction, proto, nc, conf_thresh, max_det, iou_thresh
-):
+def _segment_best_class_nms(prediction, proto, nc, conf_thresh, max_det, iou_thresh):
     """执行每 anchor best-class 的 class-aware NMS，并保持 mask coeff 对齐。"""
     pred = np.asarray(prediction, dtype=np.float32)
     if pred.ndim == 2:
@@ -1213,9 +1218,7 @@ def _segment_best_class_nms(
     scores = best_scores[candidate_mask]
     classes = best_classes[candidate_mask].astype(np.float32)
     coeffs = x[:, 4 + nc : 4 + nc + extra]
-    return _segment_class_aware_nms(
-        boxes, scores, classes, coeffs, proto, max_det, iou_thresh
-    )
+    return _segment_class_aware_nms(boxes, scores, classes, coeffs, proto, max_det, iou_thresh)
 
 
 def _class_aware_nms_dets(boxes, scores, classes, max_det, iou_thresh, max_nms=30000):
@@ -1789,7 +1792,7 @@ def nms(boxes_xyxy, scores, iou_threshold=0.7):
     return np.array(keep, dtype=int)
 
 
-def scale_boxes(dets, scale, pad_w, pad_h):
+def scale_boxes(dets, transform: LetterboxTransform):
     """将检测框从 letterbox 空间还原到原图像素坐标。
 
     反向 letterbox 变换：先减去填充偏移，再除以缩放比例。
@@ -1805,14 +1808,14 @@ def scale_boxes(dets, scale, pad_w, pad_h):
     if len(dets) == 0:
         return dets
     dets = dets.copy()
-    dets[:, 0] = (dets[:, 0] - pad_w) / scale
-    dets[:, 1] = (dets[:, 1] - pad_h) / scale
-    dets[:, 2] = (dets[:, 2] - pad_w) / scale
-    dets[:, 3] = (dets[:, 3] - pad_h) / scale
+    dets[:, 0] = (dets[:, 0] - transform.pad_x) / transform.scale_x
+    dets[:, 1] = (dets[:, 1] - transform.pad_y) / transform.scale_y
+    dets[:, 2] = (dets[:, 2] - transform.pad_x) / transform.scale_x
+    dets[:, 3] = (dets[:, 3] - transform.pad_y) / transform.scale_y
     return dets
 
 
-def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pad_w, pad_h, upsample=True):
+def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, transform, upsample=True):
     """将 seg_pre_dist / seg_pre_dfl 的 coeff/proto 组装为原图尺寸二值掩码。
 
     参数:
@@ -1839,12 +1842,12 @@ def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pa
     if not upsample:
         masks_fast = _process_mask_for_eval(proto, coeffs, seg_result["boxes"], (input_h, input_w), upsample=False)
         proto_h, proto_w = proto.shape[1:]
-        new_w = int(round(orig_w * scale))
-        new_h = int(round(orig_h * scale))
-        left = int(round(pad_w * proto_w / input_w))
-        top = int(round(pad_h * proto_h / input_h))
-        right = int(round((pad_w + new_w) * proto_w / input_w))
-        bottom = int(round((pad_h + new_h) * proto_h / input_h))
+        new_w = int(round(orig_w * transform.scale_x))
+        new_h = int(round(orig_h * transform.scale_y))
+        left = int(round(transform.pad_x * proto_w / input_w))
+        top = int(round(transform.pad_y * proto_h / input_h))
+        right = int(round((transform.pad_x + new_w) * proto_w / input_w))
+        bottom = int(round((transform.pad_y + new_h) * proto_h / input_h))
         masks_crop = masks_fast[:, top:bottom, left:right]
         masks_orig = np.zeros((masks_crop.shape[0], orig_h, orig_w), dtype=np.uint8)
         for i, mask_i in enumerate(masks_crop):
@@ -1871,9 +1874,13 @@ def _assemble_seg_masks_to_original(seg_result, imgsz, orig_h, orig_w, scale, pa
             cropped[y1:y2, x1:x2] = masks_lb[i][y1:y2, x1:x2]
         masks_lb[i] = cropped
 
-    new_w = int(round(orig_w * scale))
-    new_h = int(round(orig_h * scale))
-    masks_crop = masks_lb[:, pad_h : pad_h + new_h, pad_w : pad_w + new_w]
+    new_w = int(round(orig_w * transform.scale_x))
+    new_h = int(round(orig_h * transform.scale_y))
+    masks_crop = masks_lb[
+        :,
+        transform.pad_y : transform.pad_y + new_h,
+        transform.pad_x : transform.pad_x + new_w,
+    ]
     masks_orig = np.zeros((masks_crop.shape[0], orig_h, orig_w), dtype=np.uint8)
     for i, mask_i in enumerate(masks_crop):
         resized = cv2.resize(mask_i, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
@@ -1995,14 +2002,14 @@ def _resize_gt_masks_for_eval(masks, target_shape):
     return resized
 
 
-def _letterbox_boxes(boxes, scale, pad_w, pad_h, imgsz):
+def _letterbox_boxes(boxes, transform: LetterboxTransform, imgsz):
     """将原图 xyxy 框映射到 letterbox 输入空间。"""
     if len(boxes) == 0:
         return boxes.astype(np.float32)
     input_h, input_w = parse_input_shape(imgsz)
     out = boxes.astype(np.float32).copy()
-    out[:, [0, 2]] = out[:, [0, 2]] * scale + pad_w
-    out[:, [1, 3]] = out[:, [1, 3]] * scale + pad_h
+    out[:, [0, 2]] = out[:, [0, 2]] * transform.scale_x + transform.pad_x
+    out[:, [1, 3]] = out[:, [1, 3]] * transform.scale_y + transform.pad_y
     out[:, [0, 2]] = np.clip(out[:, [0, 2]], 0, input_w)
     out[:, [1, 3]] = np.clip(out[:, [1, 3]], 0, input_h)
     return out
@@ -2134,8 +2141,14 @@ class OnnxBackend:
         available = set(ort.get_available_providers())
         providers = [name for name in ("CUDAExecutionProvider", "CPUExecutionProvider") if name in available]
         self.sess = ort.InferenceSession(model_path, providers=providers)
-        self.input_name = self.sess.get_inputs()[0].name
-        self.imgsz = imgsz
+        input_meta = self.sess.get_inputs()[0]
+        self.input_name = input_meta.name
+        self.imgsz = parse_input_shape(imgsz)
+        input_h, input_w = self.imgsz
+        actual_shape = list(input_meta.shape)
+        expected_shape = [1, 3, input_h, input_w]
+        if actual_shape != expected_shape:
+            raise ValueError(f"ONNX 输入 {actual_shape} 与评测尺寸 {expected_shape} 不一致")
 
     def infer(self, img_hwc_uint8):
         """执行单张图片推理，返回模型原始输出列表。"""
@@ -2587,7 +2600,7 @@ def evaluate_coco(
             continue
 
         orig_h, orig_w = img.shape[:2]
-        padded, scale, (pad_w, pad_h) = letterbox(img, imgsz)
+        padded, transform = letterbox(img, imgsz)
         outputs = backend.infer(padded)
 
         if output_format == "unknown":
@@ -2612,9 +2625,7 @@ def evaluate_coco(
                 imgsz,
                 orig_h,
                 orig_w,
-                scale,
-                pad_w,
-                pad_h,
+                transform,
                 upsample=(mask_eval == "native"),
             )
             dets = (
@@ -2622,7 +2633,7 @@ def evaluate_coco(
                 if seg_result["boxes"].shape[0]
                 else np.zeros((0, 6), dtype=np.float32)
             )
-            dets = scale_boxes(dets, scale, pad_w, pad_h)
+            dets = scale_boxes(dets, transform)
             mask_rles = _encode_binary_masks_to_coco_rles(seg_masks)
             for det, rle in zip(dets, mask_rles):
                 x1, y1, x2, y2, score, cls_id = det
@@ -2646,7 +2657,7 @@ def evaluate_coco(
         else:
             dets = decode_outputs(outputs, conf, max_det, iou_thresh, imgsz=imgsz)
             dets = _limit_coco_dets_to_topk(dets, min(max_det, 100))
-            dets = scale_boxes(dets, scale, pad_w, pad_h)
+            dets = scale_boxes(dets, transform)
 
             for det in dets:
                 x1, y1, x2, y2, score, cls_id = det
@@ -2815,7 +2826,7 @@ def evaluate_yolo(
             continue
 
         orig_h, orig_w = img.shape[:2]
-        padded, scale, (pad_w, pad_h) = letterbox(img, imgsz)
+        padded, transform = letterbox(img, imgsz)
         outputs = backend.infer(padded)
 
         if output_format == "unknown":
@@ -2863,9 +2874,7 @@ def evaluate_yolo(
                 orig_w,
                 orig_h,
                 imgsz,
-                scale,
-                pad_w,
-                pad_h,
+                transform,
                 mask_downsample_ratio=mask_ratio,
                 overlap_mask=overlap_mask,
                 nc=nc,
@@ -2885,7 +2894,7 @@ def evaluate_yolo(
             gt_raw = labels.get(stem, [])
             gt_xyxy = yolo_to_xyxy(gt_raw, orig_w, orig_h)  # [N_gt, 5]
             if len(gt_xyxy) > 0:
-                gt_boxes = _letterbox_boxes(gt_xyxy[:, 1:5], scale, pad_w, pad_h, imgsz)
+                gt_boxes = _letterbox_boxes(gt_xyxy[:, 1:5], transform, imgsz)
                 gt_classes = gt_xyxy[:, 0].astype(int)
             else:
                 gt_boxes = np.zeros((0, 4), dtype=np.float32)
@@ -3131,7 +3140,10 @@ def main():
     all_results = {}
     for model_path in model_paths:
         model_name = os.path.basename(model_path)
-        imgsz = parse_input_shape(args.imgsz or infer_input_size(model_path))
+        model_imgsz = parse_input_shape(infer_input_size(model_path))
+        imgsz = parse_input_shape(args.imgsz) if args.imgsz else model_imgsz
+        if imgsz != model_imgsz:
+            raise ValueError(f"请求评测尺寸 {imgsz} 与模型静态输入 {model_imgsz} 不一致: {model_path}")
         imgsz_text = format_input_shape(imgsz)
         print(f"\n{'=' * 70}")
         print(f"模型: {model_name}  (imgsz={imgsz_text})")

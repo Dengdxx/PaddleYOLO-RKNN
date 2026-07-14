@@ -25,11 +25,14 @@ from pathlib import Path
 import onnx
 from onnx import TensorProto, helper
 
+from export.input_shape import StaticInputShape, static_imgsz_hw
+
 
 PREDIST_LTRB_TENSOR = "/model.23/Concat_output_0"
 PREDIST_CLS_TENSOR = "/model.23/Concat_1_output_0"
 PREDFL_DFL_TENSOR = "/model.22/Concat_output_0"
 PREDFL_CLS_TENSOR = "/model.22/Concat_1_output_0"
+DEFAULT_STRIDES = (8, 16, 32)
 
 
 def value_info_shape(value_info) -> list[int]:
@@ -45,6 +48,60 @@ def value_info_shape(value_info) -> list[int]:
         else:
             dims.append(0)
     return dims
+
+
+def expected_anchor_count(imgsz: StaticInputShape, strides: tuple[int, ...] = DEFAULT_STRIDES) -> int:
+    """!
+    @brief 计算固定矩形输入在各检测层上的 anchor 总数。
+    @param imgsz 静态输入尺寸。
+    @param strides 检测头特征层步幅。
+    @return 所有特征层网格数之和。
+    """
+    input_h, input_w = static_imgsz_hw(imgsz)
+    return sum((input_h // stride) * (input_w // stride) for stride in strides)
+
+
+def validate_det_deployment_contract(
+    onnx_model: onnx.ModelProto,
+    imgsz: StaticInputShape,
+    route: str,
+    input_path: str,
+    strides: tuple[int, ...] = DEFAULT_STRIDES,
+) -> None:
+    """!
+    @brief 校验检测 ONNX 的静态输入与 route 输出几何契约。
+    @param onnx_model 已加载的 ONNX 模型。
+    @param imgsz 请求的静态输入尺寸。
+    @param route 检测部署路由，`pre_dist` 或 `pre_dfl`。
+    @param input_path 模型路径，用于错误信息。
+    @param strides 检测头特征层步幅。
+    @throw ValueError 输入形状、输出形状或 anchor 数不符合契约时抛出。
+    """
+    if not onnx_model.graph.input:
+        raise ValueError(f"{input_path} 不包含 ONNX 输入")
+    input_shape = value_info_shape(onnx_model.graph.input[0])
+    input_h, input_w = static_imgsz_hw(imgsz)
+    expected_input = [1, 3, input_h, input_w]
+    if input_shape != expected_input:
+        raise ValueError(f"检测部署要求静态输入 {expected_input}，{input_path} 实际为 {input_shape}")
+
+    outputs = onnx_model.graph.output
+    if len(outputs) != 2:
+        raise ValueError(f"{route} 要求双输出，实际为 {len(outputs)} 输出")
+    box_shape, cls_shape = [value_info_shape(output) for output in outputs]
+    anchors = expected_anchor_count(imgsz, strides)
+    if len(box_shape) != 3 or len(cls_shape) != 3 or box_shape[0] != 1 or cls_shape[0] != 1:
+        raise ValueError(f"{route} 要求静态 3D 双输出，实际为 {box_shape} / {cls_shape}")
+    if box_shape[2] != anchors or cls_shape[2] != anchors:
+        raise ValueError(
+            f"{route} anchor 数不一致：输出={box_shape[2]}/{cls_shape[2]}，"
+            f"输入={input_h}x{input_w} 按 strides={list(strides)} 应为 {anchors}"
+        )
+    box_channels = box_shape[1]
+    if route == "pre_dist" and box_channels != 4:
+        raise ValueError(f"pre_dist box 通道必须为 4，实际为 {box_channels}")
+    if route == "pre_dfl" and (box_channels <= 4 or box_channels % 4 != 0):
+        raise ValueError(f"pre_dfl box 通道必须为 4*reg_max 且大于 4，实际为 {box_channels}")
 
 
 def _graph_tensor_names(graph) -> set[str]:
@@ -194,7 +251,7 @@ def make_predfl_onnx(input_path: str, output_path: str | None = None) -> str:
 
 def prepare_det_onnx_i8_input(
     weights_path: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     export_onnx_func,
 ) -> tuple[str, str, list[str]]:
     """!
@@ -217,8 +274,17 @@ def prepare_det_onnx_i8_input(
         cleanup_paths.append(source_path)
 
     onnx_model = onnx.load(source_path)
+    if not onnx_model.graph.input:
+        raise ValueError(f"{source_path} 不包含 ONNX 输入")
+    input_h, input_w = static_imgsz_hw(imgsz)
+    input_shape = value_info_shape(onnx_model.graph.input[0])
+    if input_shape != [1, 3, input_h, input_w]:
+        raise ValueError(
+            f"请求输入尺寸 {(input_h, input_w)} 与 ONNX 静态输入 {tuple(input_shape[2:])} 不一致: {source_path}"
+        )
     try:
         route = detect_prepared_det_onnx_i8_route(onnx_model)
+        validate_det_deployment_contract(onnx_model, imgsz, route, source_path)
         return route, source_path, cleanup_paths
     except ValueError:
         pass
@@ -229,6 +295,7 @@ def prepare_det_onnx_i8_input(
         prepared = make_predist_onnx(source_path, str(tmp_dir / (Path(source_path).stem + "_predist.onnx")))
     else:
         prepared = make_predfl_onnx(source_path, str(tmp_dir / (Path(source_path).stem + "_predfl.onnx")))
+    validate_det_deployment_contract(onnx.load(prepared), imgsz, route, prepared)
     cleanup_paths.append(str(tmp_dir))
     return route, prepared, cleanup_paths
 

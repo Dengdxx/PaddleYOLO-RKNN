@@ -40,6 +40,10 @@
 - mask 像素计数/hash 属于正确性校验，默认关闭；启用时单独报告
   `mask_verify_ms`，不计入单帧 `postproc_ms` 与 `e2e_ms`
 
+bench 从 RKNN 输入属性读取独立 H/W，矩形模型的 raw RGB 输入
+必须精确为 `height * width * 3` 字节。`tools.eval` 则优先读取
+`.model.yaml`，并在推理前校验模型哈希与静态输入尺寸。
+
 ### CLI
 
 ```

@@ -158,7 +158,11 @@ def check_imgsz(imgsz, stride=32, min_dim=1, max_dim=2, floor=0):
     elif isinstance(imgsz, (list, tuple)):
         imgsz = list(imgsz)
     elif isinstance(imgsz, str):
-        imgsz = [int(imgsz)] if imgsz.isnumeric() else ast.literal_eval(imgsz)
+        rectangular = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", imgsz)
+        if rectangular:
+            imgsz = [int(rectangular.group(1)), int(rectangular.group(2))]
+        else:
+            imgsz = [int(imgsz)] if imgsz.isnumeric() else ast.literal_eval(imgsz)
     else:
         raise TypeError(
             f"'imgsz={imgsz}' 类型无效: {type(imgsz).__name__}。有效 imgsz 类型为 int，例如 'imgsz=640'；或 list，例如 'imgsz=[640,640]'"

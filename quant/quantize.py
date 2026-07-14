@@ -62,7 +62,7 @@ from export.det_onnx_routes import (
     infer_det_onnx_i8_route as _infer_det_onnx_i8_route,
     prepare_det_onnx_i8_input,
 )
-from export.input_shape import StaticInputShape, static_imgsz_hw
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz, static_imgsz_hw
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ def auto_export_onnx(weights_path: str, imgsz: StaticInputShape) -> str:
     return str(out)
 
 
-def prepare_onnx_i8_input(weights_path: str, imgsz: int) -> tuple[str, str, list[str]]:
+def prepare_onnx_i8_input(weights_path: str, imgsz: StaticInputShape) -> tuple[str, str, list[str]]:
     """!
     @brief 为 ONNX INT8 量化准备主线输入模型。
     @param weights_path 用户提供的输入权重路径。
@@ -167,6 +167,8 @@ def build_calib_loader(data_yaml: str, imgsz: StaticInputShape, batch: int, n_ba
     import cv2
     import numpy as np
     from pathlib import Path
+
+    from tools.eval.backend_utils import letterbox_image
 
     if batch <= 0 or n_batches <= 0:
         raise ValueError("校准 batch 和 n_batches 必须大于 0")
@@ -264,29 +266,6 @@ def build_calib_loader(data_yaml: str, imgsz: StaticInputShape, batch: int, n_ba
         f"宽高比范围={sampled_ratios.min():.3f}..{sampled_ratios.max():.3f}"
     )
 
-    def _letterbox_rect(img: np.ndarray, new_shape: tuple[int, int]) -> np.ndarray:
-        h, w = img.shape[:2]
-        r = min(new_shape[0] / h, new_shape[1] / w)
-        r = min(r, 1.0)  # scaleup=False，不放大小图
-        new_unpad = (round(w * r), round(h * r))
-        dw = new_shape[1] - new_unpad[0]
-        dh = new_shape[0] - new_unpad[1]
-        dw /= 2
-        dh /= 2
-        if (w, h) != new_unpad:
-            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-        top, bottom = round(dh - 0.1), round(dh + 0.1)
-        left, right = round(dw - 0.1), round(dw + 0.1)
-        return cv2.copyMakeBorder(
-            img,
-            top,
-            bottom,
-            left,
-            right,
-            cv2.BORDER_CONSTANT,
-            value=(114, 114, 114),
-        )
-
     batches: list[dict[str, np.ndarray]] = []
     for batch_idx in range(0, len(img_files), batch):
         batch_files = img_files[batch_idx : batch_idx + batch]
@@ -296,7 +275,7 @@ def build_calib_loader(data_yaml: str, imgsz: StaticInputShape, batch: int, n_ba
             if img is None:
                 continue
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = _letterbox_rect(img, (input_h, input_w))
+            img, _ = letterbox_image(img, (input_h, input_w), pad_value=114, scaleup=False)
             imgs.append(img.transpose(2, 0, 1))
         if imgs:
             batches.append({"img": np.stack(imgs)})
@@ -456,16 +435,21 @@ def quantize_onnx(args):
         sys.exit(1)
 
     weights_path = str(args.weights)
-    output_path = str(args.output)
-    if not output_path.endswith(".onnx"):
-        output_path += ".onnx"
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-
     route, prepared_onnx_path, cleanup_paths = prepare_onnx_i8_input(weights_path, args.imgsz)
     public_route = "predfl" if route == "pre_dfl" else "predist"
     if args.route and args.route != public_route:
         cleanup_temp_paths(cleanup_paths)
         raise ValueError(f"请求 route={args.route}，但模型实际为 {public_route}")
+    if args.output:
+        output_path = str(args.output)
+    else:
+        weights = Path(weights_path)
+        stem = weights.stem[:-7] if weights.stem.endswith("_paddle") else weights.stem
+        shape_tag = format_static_imgsz(args.imgsz)
+        output_path = str(weights.with_name(f"{stem}_paddle_{public_route}_int8_{shape_tag}.onnx"))
+    if not output_path.endswith(".onnx"):
+        output_path += ".onnx"
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
     preprocessed_path = ""
     print(f"[PTQ-ONNX] 已确认路线: {route}")
     print(f"[PTQ-ONNX] 加载 ONNX 模型: {prepared_onnx_path}")
@@ -484,7 +468,12 @@ def quantize_onnx(args):
 
     # 构建校准数据 — 必须匹配 ONNX 的固定输入形状
     print(f"[PTQ-ONNX] 构建校准数据（{args.calib_batches} batches）...")
-    loader, n_batches = build_calib_loader(args.data, onnx_h, batch=onnx_batch, n_batches=args.calib_batches)
+    loader, n_batches = build_calib_loader(
+        args.data,
+        (onnx_h, onnx_w),
+        batch=onnx_batch,
+        n_batches=args.calib_batches,
+    )
 
     # 收集校准张量，逐张 letterbox 到 ONNX 期望尺寸
     calib_data = []
@@ -579,8 +568,23 @@ def quantize_onnx(args):
             per_channel=True,  # per-channel 权重量化精度更高
             reduce_range=False,
         )
+        quantized_model = onnx.load(output_path)
+        validate_route = "pre_dfl" if route == "pre_dfl" else "pre_dist"
+        from export.det_onnx_routes import validate_det_deployment_contract
+
+        validate_det_deployment_contract(quantized_model, args.imgsz, validate_route, output_path)
+        from export.model_manifest import write_model_manifest
+
+        manifest_path = write_model_manifest(
+            output_path,
+            prepared_onnx_path,
+            public_route,
+            args.imgsz,
+            data_yaml=args.data,
+        )
         size_mb = os.path.getsize(output_path) / 1024 / 1024
         print(f"[PTQ-ONNX] 量化完成！模型已保存至 {output_path}  ({size_mb:.1f} MB)")
+        print(f"[PTQ-ONNX] 清单: {manifest_path}")
         print("  ONNX INT8 可用于主机侧验证；RKNN 部署请使用 export_det_rknn_i8.py / export_seg_rknn_i8.py。")
     finally:
         if preprocessed_path and os.path.exists(preprocessed_path):
@@ -634,7 +638,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="输出路径；默认写到输入权重同目录",
     )
-    parser.add_argument("--imgsz", type=int, default=640, help="校准图像尺寸（默认 640）")
+    parser.add_argument(
+        "--imgsz",
+        nargs="+",
+        default=["640"],
+        metavar="SIZE",
+        help="校准图像尺寸：SIZE、HxW 或 H W（默认 640）",
+    )
     parser.add_argument("--route", choices=["predist", "predfl"], help="ONNX 模式要求的部署 route")
     parser.add_argument("--batch", type=int, default=4, help="校准数据 batch size（默认 4）")
     parser.add_argument(
@@ -652,15 +662,13 @@ def main() -> int:
     @return 成功返回 `0`。
     """
     args = parse_args()
+    args.imgsz = normalize_static_imgsz(args.imgsz)
 
     # 自动设置默认输出路径
-    if args.output is None:
+    if args.output is None and args.mode == "paddle":
         weights_path = Path(args.weights)
         stem = weights_path.stem
-        if args.mode == "onnx":
-            args.output = str(weights_path.with_name(f"{stem}_int8.onnx"))
-        else:
-            args.output = str(weights_path.with_name(f"{stem}_int8"))
+        args.output = str(weights_path.with_name(f"{stem}_int8"))
 
     print("=" * 60)
     print(f"  模式:       {args.mode.upper()} PTQ")

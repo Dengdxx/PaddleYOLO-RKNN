@@ -20,7 +20,7 @@ Paddle / ONNX / RKNN 产物使用下面的命名：
 | `framework` | `paddle` | 训练框架来源 |
 | `route` | `e2e` / `raw` / `predist` / `predfl` / `seg_predist` / `seg_predfl` | 头部导出路线（见下） |
 | `precision` | `fp32` / `int8` | 数值精度 |
-| `imgsz` | `640` 等 | 输入边长 |
+| `imgsz` | `640` / `480x640` | 静态输入尺寸，矩形按 `height x width` |
 | `ext` | `.onnx` / `.rknn` / `.pdparams` | 产物格式 |
 
 **route 取值含义：**
@@ -35,6 +35,19 @@ Paddle / ONNX / RKNN 产物使用下面的命名：
 | `seg_predfl` | 分割版 predfl，附 mask 系数 + proto | YOLOv8-Seg |
 
 **Paddle 权重命名：** 使用 `<stem>.pdparams`。
+
+`predict/export`、ONNX/RKNN 量化和静态 evaluator 支持
+`--imgsz 640`、`--imgsz 480x640` 与 `--imgsz 480 640`。高度和宽度
+必须分别对齐 `max(32, 模型最大 stride)`；不支持 RKNN 运行时动态尺寸。
+标准训练与 Paddle `val` 仍使用标量方形 `imgsz`。
+
+INT8 校准图像会在 Toolkit 编译前显式执行 RGB、居中 letterbox、
+填充 114 和 `scaleup=false`，不依赖 RKNN Toolkit 隐式拉伸。
+这与 Ultralytics `val`/INT8 校准的不放大语义对齐；通用
+Paddle `predict` 仍保留上游默认 `scaleup=true`。静态部署评测和
+SmartCar 必须使用 manifest 声明的 `scaleup=false` 契约。
+每个部署产物同时生成 `<model>.<ext>.model.yaml`，记录 H/W、route、
+anchor/proto 契约、类别名和最终模型 SHA-256。
 
 **示例：**
 

@@ -60,9 +60,7 @@ from pathlib import Path
 
 from ddyolo26 import __version__
 from ddyolo26.cfg import TASK2DATA, get_cfg
-from ddyolo26.data import build_dataloader
-from ddyolo26.data.dataset import YOLODataset
-from ddyolo26.data.utils import check_det_dataset
+from ddyolo26.data.utils import check_cls_dataset
 from ddyolo26.nn.autobackend import check_class_names, default_class_names
 from ddyolo26.nn.modules import C2f, Detect
 from ddyolo26.nn.tasks import DetectionModel, SegmentationModel
@@ -78,9 +76,10 @@ from ddyolo26.utils import (
     is_dgx,
     is_jetson,
 )
-from ddyolo26.utils.checks import check_imgsz, check_requirements, check_tensorrt, check_version
+from ddyolo26.utils.checks import check_requirements, check_tensorrt, check_version
 from ddyolo26.utils.export import onnx2engine, paddle2onnx_export
 from ddyolo26.utils.files import file_size
+from ddyolo26.utils.image_shape import format_imgsz, validate_imgsz_stride
 from ddyolo26.utils.nms import PaddleNMS
 from ddyolo26.utils.ops import Profile
 from ddyolo26.utils.patches import arange_patch
@@ -287,7 +286,8 @@ class Exporter:
         if self.args.half and self.args.int8:
             LOGGER.warning("half=True 与 int8=True 互斥，已设置 half=False。")
             self.args.half = False
-        self.imgsz = check_imgsz(self.args.imgsz, stride=model.stride, min_dim=2)
+        model_stride = max(32, int(max(model.stride.tolist())))
+        self.imgsz = validate_imgsz_stride(self.args.imgsz, model_stride)
         if self.args.optimize:
             raise ValueError("Paddle-only 导出格式不支持 optimize=True。")
         if rknn:
@@ -393,20 +393,23 @@ class Exporter:
             exported.append(self.export_rknn())
         if exported:
             f = str(Path(exported[-1]))
-            square = self.imgsz[0] == self.imgsz[1]
-            s = (
-                ""
-                if square
-                else f"警告 ⚠️ 非 Paddle 验证要求方形输入，'imgsz={self.imgsz}' 不可用。如需验证，请使用导出参数 'imgsz={max(self.imgsz)}'。"
+            imgsz = format_imgsz(self.imgsz)
+            predict_imgsz = (
+                str(self.imgsz.height)
+                if self.imgsz.height == self.imgsz.width
+                else f"{self.imgsz.height},{self.imgsz.width}"
             )
-            imgsz = self.imgsz[0] if square else str(self.imgsz)[1:-1].replace(" ", "")
             q = "int8" if self.args.int8 else "half" if self.args.half else ""
+            if self.imgsz.height == self.imgsz.width:
+                validation = f"yolo val task={model.task} model={f} imgsz={self.imgsz.height} data={data} {q}"
+            else:
+                validation = f"标准 yolo val 保持标量方形 imgsz；静态矩形 {imgsz} 请使用对应部署 evaluator"
             LOGGER.info(
                 f"""
 导出完成 ({time.time() - t:.1f}s)
 结果保存到 {colorstr("bold", file.parent.resolve())}
-推理:           yolo predict task={model.task} model={f} imgsz={imgsz} {q}
-验证:           yolo val task={model.task} model={f} imgsz={imgsz} data={data} {q} {s}
+推理:           yolo predict task={model.task} model={f} imgsz={predict_imgsz} {q}
+验证:           {validation}
 可视化:         https://netron.app"""
             )
         else:
@@ -415,26 +418,162 @@ class Exporter:
         return f
 
     def get_int8_calibration_dataloader(self, prefix=""):
-        """构建并返回 INT8 模型校准 dataloader。"""
+        """!
+        @brief 构建不依赖训练 Dataset 形状语义的静态 INT8 校准加载器。
+        @return 迭代产生 `{"img": BCHW uint8}` Paddle 张量的校准加载器。
+        """
         LOGGER.info(f"{prefix} 正在从 'data={self.args.data}' 收集 INT8 校准图片")
-        data = check_det_dataset(self.args.data)
-        dataset = YOLODataset(
-            data[self.args.split or "val"],
-            data=data,
-            fraction=self.args.fraction,
-            task=self.model.task,
-            imgsz=self.imgsz[0],
-            augment=False,
-            batch_size=self.args.batch,
-        )
-        n = len(dataset)
-        if n < self.args.batch:
-            raise ValueError(f"校准数据集 ({n} 张图片) 的图片数必须不少于 batch size ('batch={self.args.batch}')。")
-        elif self.args.format == "axelera" and n < 100:
+        if self.model.task == "classify":
+            if self.imgsz.height != self.imgsz.width:
+                raise ValueError("分类 INT8 校准对齐 Ultralytics 标准方形验证预处理，不支持矩形 imgsz")
+            data = check_cls_dataset(self.args.data)
+            split_path = data[self.args.split or "val"]
+            if split_path is None:
+                raise ValueError(f"分类校准数据集缺少 split={self.args.split or 'val'}")
+            image_extensions = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
+            image_paths = [
+                path
+                for path in sorted(Path(split_path).rglob("*"))
+                if path.is_file() and path.suffix.lower() in image_extensions
+            ]
+            if self.args.fraction < 1.0:
+                image_paths = image_paths[: max(1, round(len(image_paths) * self.args.fraction))]
+            n = len(image_paths)
+            if n <= 0:
+                raise ValueError("分类校准数据集不包含可用图片")
+            effective_batch = min(self.args.batch, n)
+            if effective_batch != self.args.batch:
+                LOGGER.warning(
+                    f"{prefix} 分类校准图片数 {n} 小于 batch={self.args.batch}，已自动降为 batch={effective_batch}"
+                )
+            import cv2
+            import numpy as np
+
+            crop_size = self.imgsz.height
+            resize_short_side = round(crop_size / 0.875)
+            sample_count = n - n % effective_batch
+            samples: list[dict] = []
+            batch_images: list[np.ndarray] = []
+            for image_path in image_paths[:sample_count]:
+                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                if image is None:
+                    continue
+                height, width = image.shape[:2]
+                if height < width:
+                    resized_height = resize_short_side
+                    resized_width = round(width * resize_short_side / height)
+                else:
+                    resized_width = resize_short_side
+                    resized_height = round(height * resize_short_side / width)
+                image = cv2.resize(
+                    image,
+                    (resized_width, resized_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                top = (resized_height - crop_size) // 2
+                left = (resized_width - crop_size) // 2
+                image = image[top : top + crop_size, left : left + crop_size]
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
+                batch_images.append(image)
+                if len(batch_images) == effective_batch:
+                    samples.append({"img": np.stack(batch_images)})
+                    batch_images = []
+
+            class StaticClassificationCalibrationLoader:
+                """!
+                @brief 包装 Resize-short-side + CenterCrop 分类校准 batch。
+                """
+
+                def __init__(self, calibration_samples: list[dict], batch_size: int) -> None:
+                    """!
+                    @brief 初始化分类校准加载器。
+                    @param calibration_samples 已预处理的 BCHW uint8 batch。
+                    @param batch_size 有效校准 batch 大小。
+                    """
+                    self.samples = calibration_samples
+                    self.batch_size = batch_size
+
+                def __iter__(self):
+                    """!
+                    @brief 逐批转为 Paddle uint8 张量。
+                    @details INT8 backend 负责执行 `/255`，此处保持与上游
+                    `PILToTensor` 一致的 BCHW uint8 契约。
+                    @return 分类校准 batch 迭代器。
+                    """
+                    for sample in self.samples:
+                        yield {"img": paddle.to_tensor(sample["img"], dtype="uint8")}
+
+                def __len__(self) -> int:
+                    """!
+                    @brief 返回分类校准 batch 数。
+                    @return batch 数量。
+                    """
+                    return len(self.samples)
+
+            if not samples:
+                raise ValueError("分类校准数据集未产生有效 batch")
+            return StaticClassificationCalibrationLoader(samples, effective_batch)
+
+        from quant.quantize import build_calib_loader
+
+        requested_images = max(self.args.batch, round(300 * self.args.fraction))
+        requested_batches = max(1, (requested_images + self.args.batch - 1) // self.args.batch)
+        effective_batch = self.args.batch
+        try:
+            batches, _ = build_calib_loader(
+                self.args.data,
+                self.imgsz,
+                batch=effective_batch,
+                n_batches=requested_batches,
+            )
+        except ValueError as exc:
+            if "不足一个完整 batch" not in str(exc) or effective_batch == 1:
+                raise
+            effective_batch = 1
+            LOGGER.warning(f"{prefix} 校准图片数小于 batch={self.args.batch}，已自动降为 batch=1")
+            batches, _ = build_calib_loader(
+                self.args.data,
+                self.imgsz,
+                batch=effective_batch,
+                n_batches=requested_images,
+            )
+
+        class StaticCalibrationLoader:
+            """!
+            @brief 将共享 numpy 校准 batch 包装为 TensorRT calibrator 所需接口。
+            """
+
+            def __init__(self, samples: list[dict], batch_size: int) -> None:
+                """!
+                @brief 初始化静态校准加载器。
+                @param samples 已显式 RGB letterbox 的 numpy batch。
+                @param batch_size 校准批大小。
+                """
+                self.samples = samples
+                self.batch_size = batch_size
+
+            def __iter__(self):
+                """!
+                @brief 逐批转为 Paddle 张量。
+                @return 校准 batch 迭代器。
+                """
+                for sample in self.samples:
+                    yield {"img": paddle.to_tensor(sample["img"], dtype="float32")}
+
+            def __len__(self) -> int:
+                """!
+                @brief 返回校准 batch 数。
+                @return batch 数量。
+                """
+                return len(self.samples)
+
+        loader = StaticCalibrationLoader(batches, effective_batch)
+        n = len(batches) * effective_batch
+        if self.args.format == "axelera" and n < 100:
             LOGGER.warning(f"{prefix} Axelera 校准需要超过 100 张图片，当前找到 {n} 张。")
         elif self.args.format != "axelera" and n < 300:
             LOGGER.warning(f"{prefix} INT8 校准建议超过 300 张图片，当前找到 {n} 张。")
-        return build_dataloader(dataset, batch=self.args.batch, workers=0, drop_last=True)
+        return loader
 
     @try_export
     def export_onnx(self, prefix=colorstr("ONNX:")):
