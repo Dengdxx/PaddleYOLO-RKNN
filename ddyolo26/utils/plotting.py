@@ -405,6 +405,9 @@ class Annotator:
             return
         im = np.asarray(self.im).copy()
         for mask, color in zip(masks, colors_list):
+            if hasattr(mask, "numpy"):
+                mask = mask.numpy()
+            mask = np.asarray(mask)
             if mask.shape[:2] != im.shape[:2]:
                 mask = cv2.resize(mask, (im.shape[1], im.shape[0]), interpolation=cv2.INTER_NEAREST)
             colored = np.zeros_like(im)

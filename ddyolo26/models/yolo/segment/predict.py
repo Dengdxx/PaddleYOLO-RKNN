@@ -131,7 +131,10 @@ class SegmentationPredictor(DetectionPredictor):
         返回:
             (list[Results]): 包含检测框和分割掩码的 Results 对象列表。
         """
-        if getattr(self.model, "rknn", False):
+        # RKNN 与 raw ONNX 导出都返回四/五个原生分割张量；统一走同一套
+        # YOLO26 exact TopK / YOLOv8 score_sum+NMS 解码，避免把 cls 张量
+        # 误当作 proto。
+        if getattr(self.model, "rknn", False) or _is_rknn_seg_outputs(preds):
             if not _is_rknn_seg_outputs(preds):
                 count = len(preds) if isinstance(preds, (list, tuple)) else type(preds).__name__
                 raise ValueError(f"RKNN 分割模型必须返回 YOLO26 四输出或 YOLOv8 五输出，实际 {count}")
