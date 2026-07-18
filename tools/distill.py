@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (C) 2026 Dengdxx <dengdx@tju.edu.cn>
 # SPDX-License-Identifier: AGPL-3.0-only
 
@@ -67,10 +68,10 @@ from export.input_shape import normalize_static_imgsz
 
 def _logit_kd_loss(s_preds: dict, t_preds: dict, temperature: float = 4.0) -> paddle.Tensor:
     """
-    分类 logits KL 散度蒸馏。
+    分类 logits 二元响应蒸馏。
 
-    仅对 one2one 头的 scores 做温度缩放 KL 散度。
-    one2one 头是最终推理使用的头，蒸馏其 logits 对部署精度提升最直接。
+    对 one2one 和 one2many 头的 scores 做温度缩放 Bernoulli KL。
+    one2one 直接对齐最终推理头，one2many 则继续约束训练辅助头。
 
     参照官方 E2ELoss 设计：one2one 是训练后期的主导头。
 
@@ -80,7 +81,7 @@ def _logit_kd_loss(s_preds: dict, t_preds: dict, temperature: float = 4.0) -> pa
         temperature: KD 温度
 
     返回:
-        scalar KD loss
+        归一化的标量 KD loss
     """
     import paddle
     import paddle.nn.functional as F
@@ -94,10 +95,12 @@ def _logit_kd_loss(s_preds: dict, t_preds: dict, temperature: float = 4.0) -> pa
         s_scores = s_preds[head_key]["scores"]  # [B, NC, NA]
         t_scores = t_preds[head_key]["scores"]  # [B, NC, NA]
 
-        # KL(teacher || student)，温度缩放
-        s_log_prob = F.log_softmax(s_scores / T, axis=1)
-        t_prob = F.softmax(t_scores / T, axis=1)
-        cls_kd = F.kl_div(s_log_prob, t_prob, reduction="batchmean") * (T**2)
+        # YOLO 各类别是独立 sigmoid，不能按互斥类别做 softmax KL。
+        # mean 同时对 batch、anchor 和 class 归一化，避免 KD 随输入尺寸放大。
+        t_prob = F.sigmoid(t_scores.detach() / T)
+        cross_entropy = F.binary_cross_entropy_with_logits(s_scores / T, t_prob, reduction="mean")
+        teacher_entropy = F.binary_cross_entropy_with_logits(t_scores.detach() / T, t_prob, reduction="mean")
+        cls_kd = (cross_entropy - teacher_entropy) * (T**2)
         kd = kd + cls_kd
 
     return kd
@@ -195,8 +198,17 @@ class DistillDetectionTrainer:
         self._teacher = None
 
         from ddyolo26.models.yolo.detect import DetectionTrainer
+        from ddyolo26.models.yolo.segment import SegmentationTrainer
+        from ddyolo26.nn.tasks import guess_model_task, paddle_safe_load
 
-        self._trainer = DetectionTrainer(overrides=self.overrides)
+        student = self.overrides.get("model", "")
+        task = self.overrides.get("task")
+        if not task and str(student).endswith((".pdparams", "_paddle.pt")):
+            checkpoint, _ = paddle_safe_load(student)
+            task = guess_model_task(checkpoint.get("yaml", checkpoint.get("train_args", {})))
+        task = task or guess_model_task(student)
+        trainer_cls = SegmentationTrainer if task == "segment" else DetectionTrainer
+        self._trainer = trainer_cls(overrides=self.overrides)
         self._trainer.add_callback("on_pretrain_routine_end", self._inject_distill)
 
     def _inject_distill(self, trainer):
@@ -237,7 +249,11 @@ class DistillDetectionTrainer:
         if isinstance(model_sd, dict):
             # 过滤掉 shape 不匹配的键（如 teacher nc 不同导致 cls head 维度不同）
             teacher_sd = teacher.state_dict()
-            compatible_sd = {k: v for k, v in model_sd.items() if k in teacher_sd and v.shape == teacher_sd[k].shape}
+            compatible_sd = {
+                k: v.astype(teacher_sd[k].dtype) if v.dtype != teacher_sd[k].dtype else v
+                for k, v in model_sd.items()
+                if k in teacher_sd and v.shape == teacher_sd[k].shape
+            }
             skipped = set(model_sd) - set(compatible_sd)
             # 抑制 Paddle set_state_dict 对缺失键的 UserWarning
             import warnings as _w
@@ -270,61 +286,50 @@ class DistillDetectionTrainer:
         # 检查 base_criterion 是否有 update 方法（E2ELoss 有）
         has_update = hasattr(base_criterion, "update")
 
-        def distill_criterion(preds, batch):
-            """
-            task_loss + logit_kd + feature_kd。
-            始终返回 (loss[4], items[4])，验证时 kd_loss=0。
-            """
-            # 1. 标准检测 loss（E2ELoss / v8DetectionLoss）
-            task_loss, task_items = base_criterion(preds, batch)
+        def make_distill_criterion(owner):
+            """为指定模型构建带蒸馏的损失函数。"""
 
-            # 验证阶段（teacher 不参与，kd_loss 补零保持维度一致）
-            if not student_model.training:
-                zero = paddle.zeros([1], dtype=task_loss.dtype)
-                return paddle.concat([task_loss, zero]), paddle.concat([task_items, zero])
-
-            # 2. teacher 前向
-            with paddle.no_grad():
-                t_output = teacher_ref(batch["img"])
-                if isinstance(t_output, tuple):
-                    t_preds = t_output[1]
-                elif isinstance(t_output, dict):
-                    t_preds = t_output
-                else:
+            def distill_criterion(preds, batch):
+                """合并任务损失与 KD 损失，验证时仅补零占位。"""
+                task_loss, task_items = base_criterion(preds, batch)
+                if not owner.training:
                     zero = paddle.zeros([1], dtype=task_loss.dtype)
                     return paddle.concat([task_loss, zero]), paddle.concat([task_items, zero])
 
-            # 3. 解析 student preds（处理 tuple 格式）
-            s_preds = preds[1] if isinstance(preds, tuple) else preds
+                with paddle.no_grad():
+                    t_output = teacher_ref(batch["img"])
+                    if isinstance(t_output, tuple):
+                        t_preds = t_output[1]
+                    elif isinstance(t_output, dict):
+                        t_preds = t_output
+                    else:
+                        zero = paddle.zeros([1], dtype=task_loss.dtype)
+                        return paddle.concat([task_loss, zero]), paddle.concat([task_items, zero])
 
-            # 4. Logit KD（classification scores 上的 KL-div）
-            logit_loss = _logit_kd_loss(s_preds, t_preds, temperature) if kd_w > 0 else paddle.zeros([1])
+                s_preds = preds[1] if isinstance(preds, tuple) else preds
+                logit_loss = _logit_kd_loss(s_preds, t_preds, temperature) if kd_w > 0 else paddle.zeros([1])
+                feat_loss = paddle.zeros([1])
+                if feat_w > 0:
+                    for head_key in ("one2many",):
+                        s_feats = s_preds.get(head_key, {}).get("feats", [])
+                        t_feats = t_preds.get(head_key, {}).get("feats", [])
+                        if s_feats and t_feats:
+                            feat_loss = feat_loss + _feature_kd_loss(s_feats, t_feats)
 
-            # 5. Feature KD（FPN feature maps 上的 CWD-L2）
-            feat_loss = paddle.zeros([1])
-            if feat_w > 0:
-                # 提取 student 和 teacher 的 FPN 特征
-                for head_key in ("one2many",):  # 只在 one2many 上做 feat KD（有梯度）
-                    s_feats = s_preds.get(head_key, {}).get("feats", [])
-                    t_feats = t_preds.get(head_key, {}).get("feats", [])
-                    if s_feats and t_feats:
-                        feat_loss = feat_loss + _feature_kd_loss(s_feats, t_feats)
+                kd_total = kd_w * logit_loss + feat_w * feat_loss
+                combined_loss = paddle.concat([task_loss, kd_total.reshape([1])])
+                combined_items = paddle.concat([task_items, kd_total.detach().reshape([1])])
+                return combined_loss, combined_items
 
-            # 6. 合并
-            kd_total = kd_w * logit_loss + feat_w * feat_loss
-            combined_loss = paddle.concat([task_loss, kd_total.reshape([1])])
-            combined_items = paddle.concat([task_items, kd_total.detach().reshape([1])])
-            return combined_loss, combined_items
+            if has_update:
+                distill_criterion.update = base_criterion.update
+            return distill_criterion
 
-        # 保留 E2ELoss.update() 方法
-        if has_update:
-            distill_criterion.update = base_criterion.update
-
-        student_model.criterion = distill_criterion
+        student_model.criterion = make_distill_criterion(student_model)
         # 同步注入到 EMA 模型（validator 使用 EMA），保持 loss 维度一致
         if hasattr(trainer, "ema") and trainer.ema is not None:
             ema_model = unwrap_model(trainer.ema.ema)
-            ema_model.criterion = distill_criterion
+            ema_model.criterion = make_distill_criterion(ema_model)
         # 添加 kd_loss 到训练进度显示
         if hasattr(trainer, "loss_names"):
             trainer.loss_names = (*trainer.loss_names, "kd_loss")
@@ -363,14 +368,23 @@ def parse_args():
         required=True,
         help="Student 模型权重路径（待压缩的小模型，如 yolo26n.pdparams）",
     )
+    parser.add_argument("--resume", type=str, default=None, help="从指定的蒸馏 checkpoint 严格续训")
     parser.add_argument("--data", type=str, default="data/your.yaml", help="数据集配置")
     parser.add_argument("--epochs", type=int, default=50, help="训练 epoch 数")
     parser.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="图像尺寸：SIZE、HxW 或 H W")
     parser.add_argument("--batch", type=int, default=8, help="Batch 大小")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker 数")
     parser.add_argument("--device", type=str, default="0", help="训练设备")
+    parser.add_argument(
+        "--overlap-mask",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="分割标签是否采用 overlap mask；未指定时继承 student checkpoint",
+    )
     parser.add_argument("--lr0", type=float, default=0.001, help="初始学习率（蒸馏用更小 lr）")
     parser.add_argument("--lrf", type=float, default=0.01, help="最终 lr 衰减因子")
+    parser.add_argument("--mosaic", type=float, default=1.0, help="Mosaic 增强概率")
+    parser.add_argument("--patience", type=int, default=100, help="早停等待 epoch 数")
     parser.add_argument(
         "--kd-weight",
         type=float,
@@ -430,12 +444,12 @@ if __name__ == "__main__":
     print(f"  输出:         {args.output}")
     print("=" * 65)
 
-    output_path = Path(args.output)
+    output_path = Path(args.output).resolve()
     project = str(output_path.parent)
     name = output_path.name
 
     overrides = dict(
-        model=str(args.student),
+        model=str(args.resume or args.student),
         data=args.data,
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -444,12 +458,18 @@ if __name__ == "__main__":
         device=args.device,
         lr0=args.lr0,
         lrf=args.lrf,
+        mosaic=args.mosaic,
+        patience=args.patience,
         optimizer=args.optimizer,
         close_mosaic=args.close_mosaic,
         project=project,
         name=name,
         exist_ok=True,
     )
+    if args.resume:
+        overrides["resume"] = str(args.resume)
+    if args.overlap_mask is not None:
+        overrides["overlap_mask"] = args.overlap_mask
 
     trainer = DistillDetectionTrainer(
         teacher_weights=args.teacher,

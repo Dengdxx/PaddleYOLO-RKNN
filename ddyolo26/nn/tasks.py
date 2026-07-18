@@ -707,7 +707,7 @@ def paddle_safe_load(weight):
     return ckpt, file
 
 
-def load_checkpoint(weight, device=None, inplace=True, fuse=False):
+def load_checkpoint(weight, device=None, inplace=True, fuse=False, use_ema=True):
     """加载单模型权重。
 
     参数:
@@ -715,6 +715,7 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
         device (str, optional): 模型加载设备。
         inplace (bool): 是否使用 inplace 操作。
         fuse (bool): 是否融合模型。
+        use_ema (bool): 是否优先加载 EMA 权重；严格断点续训时应设为 False。
 
     返回:
         (paddle.nn.Layer): 加载后的模型。
@@ -722,7 +723,11 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     """
     ckpt, weight = paddle_safe_load(weight)
     args = {**DEFAULT_CFG_DICT, **ckpt.get("train_args", {})}
-    model_data = ckpt.get("ema") or ckpt["model"]
+    raw_model_data = ckpt.get("model")
+    ema_model_data = ckpt.get("ema")
+    model_data = (ema_model_data if use_ema else raw_model_data) or raw_model_data or ema_model_data
+    if model_data is None:
+        raise ValueError(f"Checkpoint '{weight}' 同时缺少 model 和 ema 权重")
     if isinstance(model_data, dict):
         yaml_cfg = ckpt.get("yaml") or ckpt.get("train_args", {}).get("model", "yolo26n.yaml")
         # 确保 scale 已设置，避免 parse_model 发出警告。

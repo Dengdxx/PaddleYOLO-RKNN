@@ -700,18 +700,13 @@ class BaseTrainer:
         """保存带附加元数据的模型训练 checkpoint。"""
         import io
 
-        def strip_criterion(m):
-            if hasattr(m, "criterion"):
-                del m.criterion
-            return m
-
         buffer = io.BytesIO()
         paddle.save(
             obj={
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
-                "model": None,
-                "ema": strip_criterion(unwrap_model(self.ema.ema)).state_dict(),
+                "model": unwrap_model(self.model).state_dict(),
+                "ema": unwrap_model(self.ema.ema).state_dict(),
                 "yaml": self.model.yaml,
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
@@ -783,7 +778,7 @@ class BaseTrainer:
         cfg, weights = self.model, None
         ckpt = None
         if str(self.model).endswith((".pdparams", "_paddle.pt")):
-            weights, ckpt = load_checkpoint(self.model)
+            weights, ckpt = load_checkpoint(self.model, use_ema=not self.resume)
             cfg = weights.yaml
         elif isinstance(self.args.pretrained, (str, Path)):
             weights, _ = load_checkpoint(self.args.pretrained)
@@ -1092,13 +1087,13 @@ model.train(resume=True, augmentations={ckpt_args["augmentations"]})"""
         LOGGER.warning(f"检测到 {reason}（第 {self.nan_recovery_attempts}/3 次尝试），正在从 last.pdparams 恢复...")
         self._model_train()
         _, ckpt = load_checkpoint(self.last)
-        ema_state = ckpt["ema"]
-        ema_state = {k: v.astype("float32") if hasattr(v, "astype") else v for k, v in ema_state.items()}
-        if not all(paddle.isfinite(v).all() for v in ema_state.values() if isinstance(v, paddle.Tensor)):
+        model_state = ckpt.get("model") or ckpt["ema"]
+        model_state = {k: v.astype("float32") if hasattr(v, "astype") else v for k, v in model_state.items()}
+        if not all(paddle.isfinite(v).all() for v in model_state.values() if isinstance(v, paddle.Tensor)):
             raise RuntimeError(f"Checkpoint {self.last} 已损坏，包含 NaN/Inf 权重")
-        unwrap_model(self.model).load_state_dict(ema_state)
+        unwrap_model(self.model).load_state_dict(model_state)
         self._load_checkpoint_state(ckpt)
-        del ckpt, ema_state
+        del ckpt, model_state
         self.scheduler.last_epoch = epoch - 1
         return True
 
@@ -1241,6 +1236,7 @@ model.train(resume=True, augmentations={ckpt_args["augmentations"]})"""
                 f"优化器 '{name}' 不在可用优化器列表 {optimizers} 中。请通过 PaddleYOLO-RKNN 项目渠道反馈不支持的优化器。"
             )
         num_params = [len(g[0]), len(g[1]), len(g[2])]
+        num_muon_params = len(g[3]) if use_muon else 0
         g[2] = {"params": g[2], **optim_args, "param_group": "bias"}
         g[0] = {
             "params": g[0],
@@ -1251,7 +1247,6 @@ model.train(resume=True, augmentations={ckpt_args["augmentations"]})"""
         g[1] = {"params": g[1], **optim_args, "weight_decay": 0.0, "param_group": "bn"}
         muon, sgd = 0.2, 1.0
         if use_muon:
-            num_params[0] = len(g[3])
             g[3] = {
                 "params": g[3],
                 **optim_args,
@@ -1280,8 +1275,21 @@ model.train(resume=True, augmentations={ckpt_args["augmentations"]})"""
             optimizer = MuSGD(parameters=g, learning_rate=1.0, momentum=momentum, nesterov=True, muon=muon, sgd=sgd)
         else:
             optimizer = getattr(paddle.optimizer, paddle_cls_name)(parameters=g, **ctor_args)
+        if use_muon:
+            group_summary = (
+                f"{num_muon_params} 个 Muon weight(decay={decay})，"
+                f"{num_params[0]} 个 SGD weight(decay={decay})，"
+                f"{num_params[1]} 个 norm weight(decay=0.0)，"
+                f"{num_params[2]} 个 bias(decay=0.0)"
+            )
+        else:
+            group_summary = (
+                f"{num_params[1]} 个 weight(decay=0.0)，"
+                f"{num_params[0]} 个 weight(decay={decay})，"
+                f"{num_params[2]} 个 bias(decay=0.0)"
+            )
         LOGGER.info(
-            f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum})，参数组：{num_params[1]} 个 weight(decay=0.0)，{num_params[0]} 个 weight(decay={decay})，{num_params[2]} 个 bias(decay=0.0)"
+            f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum})，参数组：{group_summary}"
         )
         # 保存实际 base lr（auto 模式下可能不同于 args.lr0）。
         self._optimizer_base_lr = lr
