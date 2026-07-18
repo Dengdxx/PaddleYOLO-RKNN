@@ -2,24 +2,32 @@
 # Copyright (C) 2026 Dengdxx <dengdx@tju.edu.cn>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""比较两份 ONNX 模型在同一输入下的输出数值差异。"""
+"""比较两份 ONNX 模型在同一输入下的输出数值差异."""
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-def make_input(imgsz: int, seed: int) -> np.ndarray:
-    """生成确定性输入张量。"""
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz, static_imgsz_hw
+
+
+def make_input(imgsz: StaticInputShape, seed: int) -> np.ndarray:
+    """生成确定性输入张量."""
+    input_h, input_w = static_imgsz_hw(imgsz)
     rng = np.random.RandomState(seed)
-    return rng.uniform(0, 1, (1, 3, imgsz, imgsz)).astype(np.float32)
+    return rng.uniform(0, 1, (1, 3, input_h, input_w)).astype(np.float32)
 
 
 def compute_diff(a: np.ndarray, b: np.ndarray) -> dict:
-    """计算两组输出的误差指标。"""
+    """计算两组输出的误差指标."""
     a64 = a.astype(np.float64)
     b64 = b.astype(np.float64)
     diff = np.abs(a64 - b64)
@@ -37,7 +45,7 @@ def compute_diff(a: np.ndarray, b: np.ndarray) -> dict:
 
 
 def box_iou(a: np.ndarray, b: np.ndarray) -> float:
-    """计算两个 xyxy box 的 IoU。"""
+    """计算两个 xyxy box 的 IoU."""
     x1 = max(a[0], b[0])
     y1 = max(a[1], b[1])
     x2 = min(a[2], b[2])
@@ -50,10 +58,14 @@ def box_iou(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def compare_detection_outputs(lhs: np.ndarray, rhs: np.ndarray, top_k: int = 50) -> dict:
-    """对 e2e detection 输出做排序/匹配比较。
+    """对 e2e detection 输出做排序/匹配比较.
 
     默认假设格式为 [B, N, 6+nm]，其中第 5 列是 confidence。
     """
+    top_k = min(top_k, lhs.shape[1], rhs.shape[1])
+    if top_k <= 0:
+        return {"error": "没有可比较的 detection 输出", "num_matched": 0}
+
     lhs_order = np.argsort(-lhs[0, :, 4])
     rhs_order = np.argsort(-rhs[0, :, 4])
     lhs_sorted = lhs[:, lhs_order, :]
@@ -96,28 +108,57 @@ def compare_detection_outputs(lhs: np.ndarray, rhs: np.ndarray, top_k: int = 50)
 
 
 def run_model(path: Path, x: np.ndarray) -> list[np.ndarray]:
-    """运行单个 ONNX 模型并返回全部输出。"""
+    """运行单个 ONNX 模型并返回全部输出."""
     sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
     return [out.astype(np.float32) for out in sess.run(None, {input_name: x})]
 
 
+def is_e2e_detection_output(lhs: np.ndarray, rhs: np.ndarray) -> bool:
+    """判断两个输出是否都符合 `[1,K,6+nm]` 的 e2e 检测布局."""
+    return (
+        lhs.shape == rhs.shape
+        and lhs.ndim == 3
+        and lhs.shape[0] == 1
+        and 0 < lhs.shape[1] <= 300
+        and 6 <= lhs.shape[2] <= 256
+    )
+
+
 def main():
-    """运行两份 ONNX 模型并输出逐输出张量的数值差异报告。"""
+    """运行两份 ONNX 模型并输出逐输出张量的数值差异报告."""
     parser = argparse.ArgumentParser(description="比较两份 ONNX 模型输出")
     parser.add_argument("lhs", help="左侧 ONNX 路径")
     parser.add_argument("rhs", help="右侧 ONNX 路径")
-    parser.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸")
+    parser.add_argument(
+        "--imgsz",
+        nargs="+",
+        default=None,
+        metavar="SIZE",
+        help="预期输入尺寸：SIZE、HxW 或 H W；默认从 ONNX 读取",
+    )
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--out", default="", help="可选 JSON 输出路径")
     args = parser.parse_args()
 
     lhs = Path(args.lhs)
     rhs = Path(args.rhs)
-    x = make_input(args.imgsz, args.seed)
+    lhs_session = ort.InferenceSession(str(lhs), providers=["CPUExecutionProvider"])
+    rhs_session = ort.InferenceSession(str(rhs), providers=["CPUExecutionProvider"])
+    lhs_shape = list(lhs_session.get_inputs()[0].shape)
+    rhs_shape = list(rhs_session.get_inputs()[0].shape)
+    if lhs_shape != rhs_shape or len(lhs_shape) != 4 or lhs_shape[:2] != [1, 3]:
+        raise ValueError(f"ONNX 输入契约不一致: lhs={lhs_shape}, rhs={rhs_shape}")
+    imgsz = normalize_static_imgsz(args.imgsz or [str(lhs_shape[2]), str(lhs_shape[3])])
+    input_h, input_w = static_imgsz_hw(imgsz)
+    if lhs_shape != [1, 3, input_h, input_w]:
+        raise ValueError(f"请求尺寸 {(input_h, input_w)} 与 ONNX 输入 {lhs_shape[2:]} 不一致")
+    x = make_input(imgsz, args.seed)
 
     lhs_out = run_model(lhs, x)
     rhs_out = run_model(rhs, x)
+    if len(lhs_out) != len(rhs_out):
+        raise ValueError(f"ONNX 输出数量不一致: lhs={len(lhs_out)}, rhs={len(rhs_out)}")
 
     print(f"左侧: {lhs}")
     print(f"右侧: {rhs}")
@@ -126,7 +167,8 @@ def main():
     report = {
         "lhs": str(lhs),
         "rhs": str(rhs),
-        "imgsz": args.imgsz,
+        "imgsz": [input_h, input_w],
+        "imgsz_tag": format_static_imgsz(imgsz),
         "seed": args.seed,
         "results": {},
     }
@@ -147,7 +189,7 @@ def main():
         print(f"  左侧 range:        [{metrics['lhs_range'][0]:.6f}, {metrics['lhs_range'][1]:.6f}]")
         print(f"  右侧 range:        [{metrics['rhs_range'][0]:.6f}, {metrics['rhs_range'][1]:.6f}]")
 
-        if a.ndim == 3 and a.shape[0] == 1 and a.shape[1] <= 300 and a.shape[2] >= 6:
+        if is_e2e_detection_output(a, b):
             detection_metrics = compare_detection_outputs(a, b)
             report["results"][f"output{i}"]["detection_metrics"] = detection_metrics
             sorted_metrics = detection_metrics["topk_sorted"]

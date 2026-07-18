@@ -447,6 +447,7 @@ class DetectionModel(BaseModel):
             LOGGER.info(f"使用 nc={nc} 覆盖 model.yaml 中的 nc={self.yaml['nc']}")
             self.yaml["nc"] = nc
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        apply_activation_overrides(self.model, self.yaml.get("activation_overrides"))
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}
         self.inplace = self.yaml.get("inplace", True)
         self.args = deepcopy(DEFAULT_CFG)
@@ -929,6 +930,44 @@ def parse_model(d, ch, verbose=True):
             ch = []
         ch.append(c2)
     return paddle.nn.Sequential(*layers), sorted(save)
+
+
+def apply_activation_overrides(model, overrides):
+    """按模型顶层层号替换卷积模块的激活函数.
+
+    @brief 按模型顶层层号替换卷积模块的激活函数。
+    @param model 已由 :func:`parse_model` 构建的顶层顺序模型。
+    @param overrides 激活覆盖规则列表；每条规则包含 ``layers``
+        顶层层号列表和 ``activation`` 激活构造表达式。
+    @return 实际替换的卷积激活数量。
+    @details 覆盖在模型构建阶段完成，因而会随 checkpoint 内的 YAML
+        一起保存，重新加载、导出 ONNX 和转换 RKNN 均能恢复相同结构。
+        显式 ``act=False`` 的卷积保持 Identity，不参与覆盖。
+    """
+    if not overrides:
+        return 0
+    replaced = 0
+    for rule in overrides:
+        if not isinstance(rule, dict):
+            raise TypeError("activation_overrides 的每条规则必须是字典")
+        layers = rule.get("layers", [])
+        expression = rule.get("activation")
+        if not isinstance(layers, (list, tuple)) or not isinstance(expression, str):
+            raise ValueError("activation_overrides 规则必须包含 layers 列表和 activation 字符串")
+        for layer_index in layers:
+            if not isinstance(layer_index, int) or layer_index < 0 or layer_index >= len(model):
+                raise ValueError(f"activation_overrides 层号无效: {layer_index}")
+            target = model[layer_index]
+            modules = [target, *target.sublayers()]
+            for module in modules:
+                if not isinstance(module, Conv) or isinstance(module.act, paddle.nn.Identity):
+                    continue
+                # 每个 Conv 使用独立激活实例，避免共享模块导致参数注册耦合。
+                module.act = eval(expression, {"paddle": paddle})
+                replaced += 1
+    if replaced:
+        LOGGER.info(f"激活覆盖已应用: {replaced} 个卷积激活")
+    return replaced
 
 
 def yaml_model_load(path):

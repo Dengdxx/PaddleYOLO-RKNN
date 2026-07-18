@@ -31,6 +31,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz, static_imgsz_hw
+
 
 def portable_model_name(model_path: str) -> str:
     """!
@@ -48,7 +50,13 @@ def portable_model_name(model_path: str) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="在纯 CPU 上测试 ONNX 性能")
     p.add_argument("--model", required=True, help="ONNX 模型路径")
-    p.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸")
+    p.add_argument(
+        "--imgsz",
+        nargs="+",
+        default=None,
+        metavar="SIZE",
+        help="预期输入尺寸：SIZE、HxW 或 H W；默认从 ONNX 属性读取",
+    )
     p.add_argument("--image", default="", help="可选真实图像路径；默认使用随机 uint8 图像")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--runs", type=int, default=100)
@@ -67,18 +75,21 @@ def make_session(model_path: str, threads: int) -> object:
     return ort.InferenceSession(model_path, sess_options=opts, providers=["CPUExecutionProvider"])
 
 
-def load_image(image_path: str, imgsz: int) -> np.ndarray:
+def load_image(image_path: str, imgsz: StaticInputShape) -> np.ndarray:
     import cv2  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
 
+    input_h, input_w = static_imgsz_hw(imgsz)
     if image_path:
         img = cv2.imread(image_path)
         if img is None:
             raise FileNotFoundError(f"读取图像失败: {image_path}")
-        img = cv2.resize(img, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+        from tools.eval.backend_utils import letterbox_image  # noqa: PLC0415
+
+        img, _ = letterbox_image(img, imgsz, pad_value=114, scaleup=False)
         return img
     rng = np.random.default_rng(42)
-    return rng.integers(0, 256, size=(imgsz, imgsz, 3), dtype=np.uint8)
+    return rng.integers(0, 256, size=(input_h, input_w, 3), dtype=np.uint8)
 
 
 def main() -> int:
@@ -89,8 +100,16 @@ def main() -> int:
     from tools.eval.backend_utils import prepare_onnx_input  # noqa: PLC0415
 
     sess = make_session(args.model, args.threads)
-    input_name = sess.get_inputs()[0].name
-    img = load_image(args.image, args.imgsz)
+    input_meta = sess.get_inputs()[0]
+    input_name = input_meta.name
+    model_shape = list(input_meta.shape)
+    if len(model_shape) != 4 or model_shape[0] != 1 or model_shape[1] != 3:
+        raise ValueError(f"ONNX 必须是静态 NCHW [1,3,H,W]，实际为 {model_shape}")
+    imgsz = normalize_static_imgsz(args.imgsz or [str(model_shape[2]), str(model_shape[3])])
+    input_h, input_w = static_imgsz_hw(imgsz)
+    if model_shape != [1, 3, input_h, input_w]:
+        raise ValueError(f"请求尺寸 {(input_h, input_w)} 与 ONNX 输入 {model_shape[2:]} 不一致")
+    img = load_image(args.image, imgsz)
 
     preprocess_samples: list[float] = []
     inference_samples: list[float] = []
@@ -113,6 +132,8 @@ def main() -> int:
         "runs": args.runs,
         "warmup": args.warmup,
         "threads": args.threads,
+        "input_shape": [input_h, input_w],
+        "input_shape_tag": format_static_imgsz(imgsz),
         "preprocess_ms": round(float(np.mean(preprocess_samples)), 4),
         "inference_ms": round(float(np.mean(inference_samples)), 4),
         "total_ms": round(float(np.mean(total_samples)), 4),

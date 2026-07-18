@@ -34,9 +34,16 @@
 import argparse
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 import paddle
 import paddle.nn as nn
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from export.input_shape import format_static_imgsz, normalize_static_imgsz, static_imgsz_hw
 
 
 def parse_args():
@@ -47,7 +54,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=30, help="QAT 微调 epoch 数")
     p.add_argument("--lr0", type=float, default=5e-5, help="初始学习率（应比原始训练小 100x）")
     p.add_argument("--batch", type=int, default=16, help="批大小")
-    p.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸")
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--project", default="runs/detect", help="输出项目目录")
     p.add_argument("--name", default="qat", help="输出实验名称")
     p.add_argument("--device", default="0", help="GPU 设备")
@@ -154,6 +161,12 @@ class FakeQuantHook:
 def main():
     """主流程：加载模型 -> 注册 FakeQuant hook -> QAT 微调 -> 保存。"""
     args = parse_args()
+    parsed_imgsz = normalize_static_imgsz(args.imgsz)
+    input_h, input_w = static_imgsz_hw(parsed_imgsz)
+    if input_h != input_w:
+        raise ValueError("QAT 属于训练路线，当前仅支持方形 imgsz；静态矩形用于 predict/export")
+    args.imgsz = input_h
+    shape_tag = format_static_imgsz(parsed_imgsz)
 
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
     try:
@@ -214,7 +227,7 @@ def main():
     print(
         f'  conda run -n pdrk python3 -c "from ddyolo26 import YOLO; '
         f"YOLO('{out_dir}/weights/best.pdparams').export(format='onnx', "
-        f'imgsz={args.imgsz}, simplify=True)"'
+        f'imgsz=[{input_h}, {input_w}], simplify=True)"'
     )
     print(f"  # 2. 转换 RKNN INT8（检测主线请走 pre_dist / pre_dfl 导出链路）")
     print(f"  python export/export_det_rknn_i8.py --weights <exported.onnx> --data {args.data}")

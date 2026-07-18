@@ -30,6 +30,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz, static_imgsz_hw
+
 DEFAULT_BASELINES_ROOT = ROOT / "artifacts" / "coco_baselines"
 DEFAULT_DATA = ROOT / "ddyolo26" / "cfg" / "datasets" / "coco-val2017-only.yaml"
 EXPORT_ALL_PY = ROOT / "scripts" / "export_all_models.py"
@@ -79,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--only", default="", help="仅处理某个模型目录")
     p.add_argument("--python-paddle", default="", help="paddle/ddyolo26 路线使用的 Python 可执行文件")
     p.add_argument("--python-rknn", default="", help="RKNN Toolkit 路线使用的 Python 可执行文件")
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--calib-images", type=int, default=50)
     p.add_argument("--skip-rknn", action="store_true", help="仅导出 ONNX，跳过 RKNN")
     return p.parse_args()
@@ -141,7 +144,7 @@ def rknn_environment_identity(python_exe: str) -> dict[str, str]:
 def rknn_provenance(
     weights: Path,
     data_yaml: Path,
-    imgsz: int,
+    imgsz: StaticInputShape,
     calib_images: int,
     calib_offset: int,
     algorithm: str,
@@ -154,7 +157,7 @@ def rknn_provenance(
         "schema": 2,
         "weights_sha256": file_sha256(weights),
         "calibration_sha256": calibration_sha256(data_yaml, calib_images, calib_offset),
-        "imgsz": imgsz,
+        "imgsz": list(static_imgsz_hw(imgsz)),
         "calib_images": calib_images,
         "calib_offset": calib_offset,
         "algorithm": algorithm,
@@ -171,7 +174,8 @@ def rknn_provenance(
 def provenance_matches(output: Path, inputs: dict) -> bool:
     """仅在产物及其来源参数指纹完全一致时复用缓存。"""
     metadata = output.with_suffix(output.suffix + ".json")
-    if not output.exists() or not metadata.exists():
+    model_manifest = output.with_suffix(output.suffix + ".model.yaml")
+    if not output.exists() or not metadata.exists() or not model_manifest.exists():
         return False
     try:
         return json.loads(metadata.read_text(encoding="utf-8")) == inputs
@@ -220,7 +224,7 @@ def export_onnx_bundle(
     weights_path: Path,
     out_dir: Path,
     data_yaml: Path,
-    imgsz: int,
+    imgsz: StaticInputShape,
     paddle_python: str,
     task: str,
     route: str,
@@ -238,7 +242,7 @@ def export_onnx_bundle(
             "--data",
             str(data_yaml),
             "--imgsz",
-            str(imgsz),
+            format_static_imgsz(imgsz),
             "--task",
             task,
             "--route",
@@ -257,7 +261,7 @@ def export_det_rknn(
     weights: Path,
     out_path: Path,
     data_yaml: Path,
-    imgsz: int,
+    imgsz: StaticInputShape,
     calib_images: int,
     algorithm: str,
     auto_hybrid: bool,
@@ -291,7 +295,7 @@ def export_det_rknn(
         "--data",
         str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        format_static_imgsz(imgsz),
         "--calib-images",
         str(calib_images),
         "--calib-offset",
@@ -311,7 +315,7 @@ def export_seg_rknn(
     weights: Path,
     out_path: Path,
     data_yaml: Path,
-    imgsz: int,
+    imgsz: StaticInputShape,
     calib_images: int,
     algorithm: str,
     python_exe: str,
@@ -344,7 +348,7 @@ def export_seg_rknn(
             "--data",
             str(data_yaml),
             "--imgsz",
-            str(imgsz),
+            format_static_imgsz(imgsz),
             "--calib-images",
             str(calib_images),
             "--calib-offset",
@@ -361,6 +365,8 @@ def export_seg_rknn(
 def main() -> int:
     """准备指定 COCO baseline 模型的 ONNX 与 RKNN 产物。"""
     args = parse_args()
+    args.imgsz = normalize_static_imgsz(args.imgsz)
+    shape_tag = format_static_imgsz(args.imgsz)
     root = Path(args.root).resolve()
     data_yaml = Path(args.data).resolve()
     paddle_python = str(Path(args.python_paddle).resolve()) if args.python_paddle else sys.executable
@@ -393,7 +399,7 @@ def main() -> int:
         if cfg["task"] == "detect":
             export_det_rknn(
                 paddle_path,
-                out_dir / f"{cfg['weights_name']}_paddle_{cfg['route']}_int8_{args.imgsz}.rknn",
+                out_dir / f"{cfg['weights_name']}_paddle_{cfg['route']}_int8_{shape_tag}.rknn",
                 data_yaml,
                 args.imgsz,
                 args.calib_images,
@@ -406,7 +412,7 @@ def main() -> int:
         else:
             export_seg_rknn(
                 paddle_path,
-                out_dir / f"{cfg['weights_name']}_paddle_{cfg['route']}_int8_{args.imgsz}.rknn",
+                out_dir / f"{cfg['weights_name']}_paddle_{cfg['route']}_int8_{shape_tag}.rknn",
                 data_yaml,
                 args.imgsz,
                 args.calib_images,

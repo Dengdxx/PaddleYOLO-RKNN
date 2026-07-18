@@ -65,6 +65,26 @@ YOLO11 纳入成熟 RKNN 部署主线。
 
 ## 预训练权重
 
+### 模型级激活覆盖
+
+默认激活仍由模型 YAML 的 `activation` 统一指定。需要做部署敏感性
+实验时，可通过 `activation_overrides` 仅覆盖指定顶层模块内的卷积：
+
+```yaml
+activation: paddle.nn.SiLU()
+activation_overrides:
+  - activation: paddle.nn.ReLU()
+    layers: [0, 1, 3]
+```
+
+`layers` 是当前 YAML 的顶层层号；对应模块内所有非 Identity 卷积都会
+使用新激活。规则会写入 checkpoint，因此重新加载、ONNX 导出和 RKNN
+转换会自动保持同一结构。模型拓扑改动后必须重新核对层号；不应把
+实验性覆盖直接用于未验证的权重。
+
+仓库提供全卷积 PReLU 变体
+`ddyolo26/cfg/models/26/yolo26n-seg-prelu.yaml`，用于继续训练和部署敏感性实验。
+
 ### 短名检查
 
 先用短名解析入口检查权重是否已经可用：

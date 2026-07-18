@@ -371,7 +371,9 @@ class Exporter:
             "stride": int(max(model.stride)),
             "task": model.task,
             "batch": self.args.batch,
-            "imgsz": self.imgsz,
+            # NamedTuple/ImageShape 不能被 ast.literal_eval 解析，统一写成稳定的
+            # Python literal，兼容方形与矩形 ONNX metadata 读取。
+            "imgsz": [int(self.imgsz[0]), int(self.imgsz[1])],
             "names": model.names,
             "args": {k: v for k, v in self.args if k in fmt_keys},
             "channels": model.yaml.get("channels", 3),

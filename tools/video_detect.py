@@ -27,6 +27,11 @@
         --data data.yaml \
         --conf 0.25 --imgsz 640
 
+    # 任意文件名的分割 ONNX 显式指定任务
+    python video_detect.py \
+        --weights model.onnx --task segment \
+        --source input_video.mp4 --data data.yaml --imgsz 480x640
+
     # Paddle 训练权重推理
     python video_detect.py \
         --weights runs/detect/exp/weights/best.pdparams \
@@ -56,6 +61,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork.*
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from export.input_shape import normalize_static_imgsz
+
 import cv2
 import numpy as np
 
@@ -68,11 +75,23 @@ def parse_args():
     )
     parser.add_argument("--weights", type=str, required=True, help="模型权重路径（.onnx / .pdparams）")
     parser.add_argument("--source", type=str, required=True, help="输入视频路径，或 0 表示摄像头")
+    parser.add_argument(
+        "--task",
+        choices=["detect", "segment"],
+        default=None,
+        help="模型任务；文件名无法体现任务时显式指定",
+    )
     parser.add_argument("--data", type=str, default=None, help="数据集 yaml（用于读取类别名，如 data.yaml）")
     parser.add_argument("--output", type=str, default=None, help="输出视频路径（默认: <source>_det.mp4）")
     parser.add_argument("--conf", type=float, default=0.25, help="置信度阈值（默认 0.25）")
     parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU 阈值（默认 0.7）")
-    parser.add_argument("--imgsz", type=int, default=640, help="推理图像尺寸（默认 640）")
+    parser.add_argument(
+        "--imgsz",
+        nargs="+",
+        default=["640"],
+        metavar="SIZE",
+        help="推理图像尺寸：SIZE、HxW 或 H W（默认 640）",
+    )
     parser.add_argument("--device", type=str, default=None, help="设备：cpu / 0 / cuda:0（默认自动选择）")
     parser.add_argument("--show", action="store_true", help="实时显示检测结果窗口")
     parser.add_argument("--no-save", action="store_true", help="不保存输出视频（仅在 --show 时有用）")
@@ -84,25 +103,12 @@ def parse_args():
 def main():
     """主函数：加载模型 → 打开视频/摄像头 → 逐帧检测 → 保存/显示结果。"""
     args = parse_args()
+    args.imgsz = normalize_static_imgsz(args.imgsz)
     from ddyolo26 import YOLO
 
     # 加载模型
     print(f"加载模型: {args.weights}")
-    model = YOLO(args.weights)
-
-    # 加载类别名称
-    if args.data:
-        import yaml
-
-        with open(args.data, encoding="utf-8") as f:
-            data_cfg = yaml.safe_load(f)
-        if "names" in data_cfg:
-            names = data_cfg["names"]
-            if isinstance(names, list):
-                model.model.names = {i: n for i, n in enumerate(names)}
-            elif isinstance(names, dict):
-                model.model.names = names
-            print(f"类别: {model.model.names}")
+    model = YOLO(args.weights, task=args.task)
 
     # 确定输入源
     source = args.source
@@ -145,6 +151,10 @@ def main():
         classes=args.classes,
         verbose=False,
     )
+    if args.data is not None:
+        # 将 data 交给 AutoBackend 解析，兼容 Paddle 模型和 ONNX 等外部模型；
+        # 外部模型的 `model.model` 可能只是路径字符串，不能直接写入 `.names`。
+        predict_kwargs["data"] = args.data
     if args.device is not None:
         predict_kwargs["device"] = args.device
 

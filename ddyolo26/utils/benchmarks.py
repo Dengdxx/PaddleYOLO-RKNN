@@ -42,8 +42,9 @@ from ddyolo26 import YOLO
 from ddyolo26.cfg import TASK2DATA, TASK2METRIC
 from ddyolo26.engine.exporter import export_formats
 from ddyolo26.utils import ARM64, ASSETS, IS_JETSON, LINUX, LOGGER, MACOS, TQDM, WEIGHTS_DIR
-from ddyolo26.utils.checks import IS_PYTHON_3_13, check_imgsz, check_requirements, check_yolo, is_rockchip
+from ddyolo26.utils.checks import IS_PYTHON_3_13, check_requirements, check_yolo, is_rockchip
 from ddyolo26.utils.files import file_size
+from ddyolo26.utils.image_shape import format_imgsz, validate_imgsz_stride
 from ddyolo26.utils.runtime import get_cpu_info, select_device
 
 
@@ -82,8 +83,9 @@ def benchmark(
         >>> from ddyolo26.utils.benchmarks import benchmark
         >>> benchmark(model="weights/yolov8/yolov8n.pdparams", imgsz=640)
     """
-    imgsz = check_imgsz(imgsz)
-    assert imgsz[0] == imgsz[1] if isinstance(imgsz, list) else True, "benchmark() 仅支持 square imgsz。"
+    imgsz = validate_imgsz_stride(imgsz, 32)
+    if imgsz.height != imgsz.width:
+        raise ValueError("benchmark() 包含 val 精度评测，当前仅支持方形 imgsz")
     import polars as pl
 
     pl.Config.set_tbl_cols(-1)
@@ -251,10 +253,12 @@ class ProfileModels:
         self.num_timed_runs = num_timed_runs
         self.num_warmup_runs = num_warmup_runs
         self.min_time = min_time
-        self.imgsz = imgsz
+        self.imgsz = validate_imgsz_stride(imgsz, 32)
         self.half = half
         self.trt = trt
-        self.device = device if isinstance(device, paddle.device) else select_device(device)
+        # `paddle.device` 是函数而非可用于 isinstance 的类型；此入口参数契约为
+        # 字符串或空值，统一交给 select_device 解析，避免 CPU/None 路径崩溃。
+        self.device = select_device(device)
 
     def run(self):
         """跨 ONNX、TensorRT 等 formats profile YOLO models 的 speed 与 accuracy。
@@ -359,7 +363,7 @@ class ProfileModels:
         if not self.trt or not Path(engine_file).is_file():
             return 0.0, 0.0
         model = YOLO(engine_file)
-        input_data = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+        input_data = np.zeros((self.imgsz.height, self.imgsz.width, 3), dtype=np.uint8)
         elapsed = 0.0
         for _ in range(3):
             start_time = time.time()
@@ -406,7 +410,9 @@ class ProfileModels:
                 if len(input_tensor.shape) != 4 and self.check_dynamic(input_tensor.shape[1:]):
                     raise ValueError(f"{input_tensor.name} 的 dynamic shape {input_tensor.shape} 不受支持")
                 input_shape = (
-                    (1, 3, self.imgsz, self.imgsz) if len(input_tensor.shape) == 4 else (1, *input_tensor.shape[1:])
+                    (1, 3, self.imgsz.height, self.imgsz.width)
+                    if len(input_tensor.shape) == 4
+                    else (1, *input_tensor.shape[1:])
                 )
             else:
                 input_shape = input_tensor.shape
@@ -463,7 +469,7 @@ class ProfileModels:
             (str): 包含 model metrics 的 formatted table row string。
         """
         _layers, params, _gradients, flops = model_info
-        return f"| {model_name:18s} | {self.imgsz} | - | {t_onnx[0]:.1f}±{t_onnx[1]:.1f} ms | {t_engine[0]:.1f}±{t_engine[1]:.1f} ms | {params / 1000000.0:.1f} | {flops:.1f} |"
+        return f"| {model_name:18s} | {format_imgsz(self.imgsz)} | - | {t_onnx[0]:.1f}±{t_onnx[1]:.1f} ms | {t_engine[0]:.1f}±{t_engine[1]:.1f} ms | {params / 1000000.0:.1f} | {flops:.1f} |"
 
     @staticmethod
     def generate_results_dict(

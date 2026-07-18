@@ -21,6 +21,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz
+
 DEFAULT_BASELINES_ROOT = ROOT / "artifacts" / "coco_baselines"
 DEFAULT_DATA = ROOT / "ddyolo26" / "cfg" / "datasets" / "coco-val2017-only.yaml"
 DEFAULT_SUMMARY = DEFAULT_BASELINES_ROOT / "_host_eval_summary.json"
@@ -39,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default=str(DEFAULT_DATA), help="COCO data.yaml")
     p.add_argument("--summary", default=str(DEFAULT_SUMMARY), help="排查用运行汇总 JSON 输出路径")
     p.add_argument("--only", default="", help="仅评测某个模型目录，如 yolo26n")
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--max-images", type=int, default=0, help="限制评测图片数，0 表示全量")
     p.add_argument("--bench-runs", type=int, default=100, help="CPU benchmark 正式轮数")
     p.add_argument("--bench-warmup", type=int, default=10, help="CPU benchmark 预热轮数")
@@ -78,7 +83,7 @@ def portable_path(path: Path) -> str:
         return resolved.name
 
 
-def evaluate_onnx(model_path: Path, data_yaml: Path, imgsz: int, max_images: int, out_json: Path) -> dict:
+def evaluate_onnx(model_path: Path, data_yaml: Path, imgsz: StaticInputShape, max_images: int, out_json: Path) -> dict:
     """调用统一 eval 后端评估 ONNX，并读取输出 JSON 中的唯一模型结果。"""
     cmd = [
         sys.executable,
@@ -90,7 +95,7 @@ def evaluate_onnx(model_path: Path, data_yaml: Path, imgsz: int, max_images: int
         "--data",
         str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        format_static_imgsz(imgsz),
         "--conf",
         "0.001",
         "--iou",
@@ -108,7 +113,7 @@ def evaluate_onnx(model_path: Path, data_yaml: Path, imgsz: int, max_images: int
 
 def bench_onnx(
     model_path: Path,
-    imgsz: int,
+    imgsz: StaticInputShape,
     runs: int,
     warmup: int,
     threads: int,
@@ -122,7 +127,7 @@ def bench_onnx(
         "--model",
         str(model_path),
         "--imgsz",
-        str(imgsz),
+        format_static_imgsz(imgsz),
         "--runs",
         str(runs),
         "--warmup",
@@ -162,6 +167,7 @@ def discover_onnx_files(model_dir: Path) -> list[Path]:
 def main() -> int:
     """评估 COCO baseline 目录下的 ONNX 模型，并可选对 INT8 ONNX 跑 CPU benchmark。"""
     args = parse_args()
+    args.imgsz = normalize_static_imgsz(args.imgsz)
     root = Path(args.root).resolve()
     data_yaml = Path(args.data).resolve()
     summary_path = Path(args.summary).resolve()

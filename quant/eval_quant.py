@@ -40,6 +40,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork.*
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from export.input_shape import format_static_imgsz, normalize_static_imgsz
+
 
 # ──────────────────────────────────────────────────────────────────────
 # 工具函数
@@ -159,7 +161,13 @@ def main():
         help="校准 batch 数量（越多越精确，建议 50-200，默认 50）",
     )
     parser.add_argument("--batch", type=int, default=4, help="校准 batch size（默认 4）")
-    parser.add_argument("--imgsz", type=int, default=640, help="推理图像尺寸（默认 640）")
+    parser.add_argument(
+        "--imgsz",
+        nargs="+",
+        default=["640"],
+        metavar="SIZE",
+        help="推理图像尺寸：SIZE、HxW 或 H W（默认 640）",
+    )
     parser.add_argument("--device", type=str, default="0", help="推理设备，'0' 表示 GPU 0，'cpu'")
     parser.add_argument("--output", type=str, default="", help="输出目录；默认与输入权重同目录")
     parser.add_argument("--n-viz", type=int, default=5, help="可视化图片数量（默认 5）")
@@ -169,6 +177,10 @@ def main():
         help="同时导出 FP32 ONNX 并通过 onnxruntime 生成 INT8 ONNX（真正的 INT8 权重）",
     )
     args = parser.parse_args()
+    parsed_imgsz = normalize_static_imgsz(args.imgsz)
+    if parsed_imgsz.height != parsed_imgsz.width:
+        raise ValueError("eval_quant 包含 Paddle val，当前仅支持方形 imgsz")
+    args.imgsz = parsed_imgsz.height
     if not args.output:
         weights_path = Path(args.weights)
         args.output = str(weights_path.with_name(f"{weights_path.stem}_quant_eval"))
@@ -285,7 +297,7 @@ def main():
     ]
 
     print("\n" + "=" * 65)
-    print(f"  量化精度汇总（data={args.data}, imgsz={args.imgsz}）")
+    print(f"  量化精度汇总（data={args.data}, imgsz={format_static_imgsz(args.imgsz)}）")
     print("=" * 65)
     print(header)
     print(sep)
@@ -304,7 +316,7 @@ def main():
         f.write(f"模型权重  : {args.weights}\n")
         f.write(f"数据集    : {args.data}\n")
         f.write(f"校准数据  : {n_done} batches × batch_size={args.batch}\n")
-        f.write(f"图像尺寸  : {args.imgsz}\n")
+        f.write(f"图像尺寸  : {format_static_imgsz(args.imgsz)}\n")
         f.write(f"量化策略  : KL 激活量化 (8-bit) + per-channel absmax 权重量化 (8-bit)\n\n")
         f.write(f"{'指标':<16}{'FP32':>10}{'INT8 (PTQ)':>12}{'精度变化':>12}\n")
         f.write(f"{'-' * 52}\n")
@@ -377,21 +389,19 @@ def _export_onnx_int8(args, calib_count: int, result_path: str):
     onnx_h, onnx_w = dims[2], dims[3]
 
     print(f"  [2/3] 收集校准数据（{args.calib_batches} batches）...")
-    loader, n_batches = build_calib_loader(args.data, onnx_h, batch=onnx_batch, n_batches=args.calib_batches)
+    loader, n_batches = build_calib_loader(
+        args.data,
+        (onnx_h, onnx_w),
+        batch=onnx_batch,
+        n_batches=args.calib_batches,
+    )
 
     calib_data = []
     count = 0
     for batch_data in loader:
         imgs = batch_data["img"].astype("float32") / 255.0
         if imgs.shape[2] != onnx_h or imgs.shape[3] != onnx_w:
-            import cv2
-
-            resized = []
-            for i in range(imgs.shape[0]):
-                img = imgs[i].transpose(1, 2, 0)
-                img = cv2.resize(img, (onnx_w, onnx_h))
-                resized.append(img.transpose(2, 0, 1))
-            imgs = np.stack(resized)
+            raise ValueError(f"校准预处理尺寸 {imgs.shape[2:]} 与 ONNX 输入 {(onnx_h, onnx_w)} 不一致")
         if imgs.shape[0] != onnx_batch:
             for i in range(imgs.shape[0]):
                 calib_data.append(imgs[i : i + 1])

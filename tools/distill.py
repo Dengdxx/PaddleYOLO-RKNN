@@ -57,6 +57,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork.*
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from export.input_shape import normalize_static_imgsz
+
 
 # ──────────────────────────────────────────────────────────────────────
 # KD 损失函数
@@ -363,7 +365,7 @@ def parse_args():
     )
     parser.add_argument("--data", type=str, default="data/your.yaml", help="数据集配置")
     parser.add_argument("--epochs", type=int, default=50, help="训练 epoch 数")
-    parser.add_argument("--imgsz", type=int, default=640, help="图像尺寸")
+    parser.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="图像尺寸：SIZE、HxW 或 H W")
     parser.add_argument("--batch", type=int, default=8, help="Batch 大小")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker 数")
     parser.add_argument("--device", type=str, default="0", help="训练设备")
@@ -411,6 +413,10 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    parsed_imgsz = normalize_static_imgsz(args.imgsz)
+    if parsed_imgsz.height != parsed_imgsz.width:
+        raise ValueError("蒸馏属于训练路线，当前仅支持方形 imgsz")
+    args.imgsz = parsed_imgsz.height
 
     print("=" * 65)
     print("  YOLO26 知识蒸馏训练（Feature + Response KD）")

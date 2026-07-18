@@ -466,9 +466,16 @@ class Annotator:
             )
 
     def fromarray(self, im):
-        """从 NumPy array 或 PIL image 更新 `self.im`。"""
-        self.im = im if isinstance(im, Image.Image) else Image.fromarray(im)
-        self.draw = ImageDraw.Draw(self.im)
+        """从 NumPy array 或 PIL image 更新当前绘图画布.
+
+        @param im 新的 NumPy 或 PIL 图像。
+        @return 无返回值；保持初始化时选择的 PIL/OpenCV 绘图后端。
+        """
+        if self.pil:
+            self.im = im if isinstance(im, Image.Image) else Image.fromarray(im)
+            self.draw = ImageDraw.Draw(self.im)
+        else:
+            self.im = np.ascontiguousarray(np.asarray(im)).copy()
 
     def result(self, pil=False):
         """以 array 或 PIL image 返回 annotated image。"""

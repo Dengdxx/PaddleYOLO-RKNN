@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from export.input_shape import StaticInputShape, normalize_static_imgsz
+
 
 def parse_args() -> argparse.Namespace:
     """!
@@ -37,12 +39,13 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="导出单个模型的 FP32 ONNX")
     p.add_argument("--weights", required=True, help="输入 Paddle 权重路径（.pdparams）")
-    p.add_argument("--imgsz", type=int, default=640, help="导出输入尺寸")
+    p.add_argument("--data", required=True, help="数据集 YAML 或分类目录，用于生成权威类别名清单")
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="导出输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--output", required=True, help="输出 ONNX 路径")
     return p.parse_args()
 
 
-def export_fp32_onnx(weights_path: str, imgsz: int) -> str:
+def export_fp32_onnx(weights_path: str, imgsz: StaticInputShape) -> str:
     """!
     @brief 根据权重类型导出 FP32 ONNX。
     @param weights_path 输入权重路径。
@@ -83,15 +86,21 @@ def main() -> int:
     @return 成功返回 `0`。
     """
     args = parse_args()
-    produced = Path(export_fp32_onnx(args.weights, args.imgsz)).resolve()
+    imgsz = normalize_static_imgsz(args.imgsz)
+    produced = Path(export_fp32_onnx(args.weights, imgsz)).resolve()
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if produced != output:
         if output.exists():
             output.unlink()
         shutil.move(str(produced), str(output))
+    from export.model_manifest import infer_native_output_route, write_model_manifest
+
+    output_route = infer_native_output_route(output)
+    manifest_path = write_model_manifest(output, output, output_route, imgsz, data_yaml=args.data)
     size_mb = os.path.getsize(output) / 1024 / 1024
     print(f"[EXPORT-FP32-ONNX] 完成: {output} ({size_mb:.1f} MB)")
+    print(f"[EXPORT-FP32-ONNX] 清单: {manifest_path}")
     return 0
 
 

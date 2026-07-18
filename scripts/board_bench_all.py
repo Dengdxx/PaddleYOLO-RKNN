@@ -275,10 +275,7 @@ def main() -> None:
             rows.append(meta)
 
     print("\n=== 汇总 ===")
-    print(
-        f"{'model':<55}{'core':<6}{'npu_ms':>9}{'pp_ms':>9}"
-        f"{'sync_KiB':>10}{'e2e_ms':>9}{'fps':>8}{'outcome':>28}"
-    )
+    print(f"{'model':<55}{'core':<6}{'npu_ms':>9}{'pp_ms':>9}{'sync_KiB':>10}{'e2e_ms':>9}{'fps':>8}{'outcome':>28}")
     for r in rows:
         fps = 1000.0 / r["e2e_avg_ms"]
         npu_ms = f"{r['npu_pure_ms']:.3f}" if "npu_pure_ms" in r else "n/a"

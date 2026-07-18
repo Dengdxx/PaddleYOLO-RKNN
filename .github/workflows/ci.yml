@@ -78,15 +78,15 @@ jobs:
               [np.ones((1, 4, 2), dtype=np.float32), cls_logits, coeff, proto],
               0.25,
               2,
-              imgsz=(8, 16),
-              strides=(8,),
+              imgsz=(32, 64),
+              strides=(32,),
           )
           predfl = decode_seg_predfl(
               [np.zeros((1, 2, 8), dtype=np.float32), cls_logits, coeff, proto, score_sum],
               0.25,
               2,
-              imgsz=(8, 16),
-              strides=(8,),
+              imgsz=(32, 64),
+              strides=(32,),
               reg_max=2,
           )
           assert predist["coeffs"].shape == (2, 2)

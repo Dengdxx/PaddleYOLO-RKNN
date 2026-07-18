@@ -15,9 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from ddyolo26 import YOLO
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz
 
 
-def export_one2many(weights: str, imgsz: int) -> str:
+def export_one2many(weights: str, imgsz: StaticInputShape) -> str:
     """导出 one2many 检测头的 raw ONNX。
 
     参数:
@@ -40,7 +41,7 @@ def export_one2many(weights: str, imgsz: int) -> str:
     print(f"[INFO] one2many ONNX 已导出: {onnx_path}")
 
     src = Path(onnx_path)
-    stem = src.stem.replace("_paddle", f"_o2m_{imgsz}")
+    stem = src.stem.replace("_paddle", f"_o2m_{format_static_imgsz(imgsz)}")
     dst = src.with_name(stem + src.suffix)
     src.rename(dst)
     print(f"[INFO] 重命名为: {dst}")
@@ -51,14 +52,13 @@ def main():
     """入口函数。"""
     p = argparse.ArgumentParser(description="导出 YOLO26-seg one2many raw ONNX 中间产物")
     p.add_argument("--weights", required=True, help="Paddle 权重路径")
-    p.add_argument("--imgsz", nargs="+", type=int, default=[640, 480, 384], help="输入尺寸列表")
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     args = p.parse_args()
-
-    for sz in args.imgsz:
-        print(f"\n{'=' * 60}")
-        print(f"  导出 one2many ONNX: imgsz={sz}")
-        print(f"{'=' * 60}")
-        export_one2many(args.weights, sz)
+    imgsz = normalize_static_imgsz(args.imgsz)
+    print(f"\n{'=' * 60}")
+    print(f"  导出 one2many ONNX: imgsz={format_static_imgsz(imgsz)}")
+    print(f"{'=' * 60}")
+    export_one2many(args.weights, imgsz)
 
 
 if __name__ == "__main__":

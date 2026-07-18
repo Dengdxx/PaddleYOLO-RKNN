@@ -52,11 +52,13 @@ model.export(format="onnx", imgsz=640, simplify=True)
 # 直接从 ONNX 导出
 python export/export_rknn.py \
     --weights runs/detect/exp/weights/best_paddle_raw_fp32_640.onnx \
+    --data data/your.yaml \
     --quantize fp16
 
 # 从 .pdparams 自动导出
 python export/export_rknn.py \
     --weights runs/detect/exp/weights/best.pdparams \
+    --data data/your.yaml \
     --quantize fp16
 ```
 
@@ -112,7 +114,7 @@ python export/export_det_rknn_i8.py \
 | 参数 | 说明 |
 |------|------|
 | `--weights` | `.pdparams / onnx`，内部自动裁到 `pre_dist`；普通 `.pt` 不支持 |
-| `--data` | 校准数据集 YAML |
+| `--data` | 数据集 YAML；所有模式用于 manifest 类别表，INT8 还用于校准 |
 | `--target` | NPU 平台 |
 | `--imgsz` | 输入尺寸 |
 | `--calib-images` | 校准图数 |

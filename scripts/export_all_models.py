@@ -41,6 +41,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from export.input_shape import (
+    StaticInputShape,
+    format_static_imgsz,
+    normalize_static_imgsz,
+    static_imgsz_hw,
+)
+
 
 def log(msg: str) -> None:
     print(f"[EXPORT-ALL] {msg}", flush=True)
@@ -92,7 +99,7 @@ def rknn_environment_identity(python_exe: str) -> dict[str, str]:
     return json.loads(result.stdout)
 
 
-def calibration_sha256(data_yaml: Path, imgsz: int, calib_images: int, mode: str) -> str:
+def calibration_sha256(data_yaml: Path, imgsz: StaticInputShape, calib_images: int, mode: str) -> str:
     """哈希实际校准输入，避免数据替换后复用旧量化产物。"""
     digest = hashlib.sha256()
     digest.update(file_sha256(data_yaml).encode("ascii"))
@@ -106,11 +113,18 @@ def calibration_sha256(data_yaml: Path, imgsz: int, calib_images: int, mode: str
             digest.update(image.tobytes())
     elif mode == "rknn":
         from export.export_rknn import collect_calib_images
+        from tools.eval.backend_utils import letterbox_image
+
+        import cv2
 
         for image_path in collect_calib_images(str(data_yaml), calib_images):
-            path = Path(image_path)
-            digest.update(str(path).encode("utf-8"))
-            digest.update(file_sha256(path).encode("ascii"))
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                continue
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image, _ = letterbox_image(image, imgsz, pad_value=114, scaleup=False)
+            digest.update(str(image.shape).encode("ascii"))
+            digest.update(image.tobytes())
     else:
         raise ValueError(f"未知校准指纹模式: {mode}")
     return digest.hexdigest()
@@ -119,7 +133,8 @@ def calibration_sha256(data_yaml: Path, imgsz: int, calib_images: int, mode: str
 def cache_matches(target: Path, provenance: dict) -> bool:
     """仅在产物与来源指纹都存在且完全一致时复用。"""
     sidecar = target.with_suffix(target.suffix + ".json")
-    if not target.exists() or not sidecar.exists():
+    model_manifest = target.with_suffix(target.suffix + ".model.yaml")
+    if not target.exists() or not sidecar.exists() or not model_manifest.exists():
         return False
     try:
         return json.loads(sidecar.read_text(encoding="utf-8")) == provenance
@@ -135,11 +150,21 @@ def write_cache_provenance(target: Path, provenance: dict) -> None:
     temporary.replace(sidecar)
 
 
+def serialize_static_imgsz(imgsz: StaticInputShape) -> list[int]:
+    """!
+    @brief 将静态尺寸转为 JSON roundtrip 稳定的 `[H,W]`。
+    @param imgsz 静态输入尺寸。
+    @return 高度、宽度整数列表。
+    """
+    height, width = static_imgsz_hw(imgsz)
+    return [height, width]
+
+
 def export_provenance(
     source: Path,
     data_yaml: Path,
     route: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     calib_images: int,
     python_exe: str,
     calibration_mode: str,
@@ -151,7 +176,7 @@ def export_provenance(
         "calibration_mode": calibration_mode,
         "calibration_sha256": calibration_sha256(data_yaml, imgsz, calib_images, calibration_mode),
         "route": route,
-        "imgsz": imgsz,
+        "imgsz": serialize_static_imgsz(imgsz),
         "calib_images": calib_images,
         "python": str(Path(python_exe).resolve()),
         "pipeline_sha256": pipeline_sha256(),
@@ -161,16 +186,25 @@ def export_provenance(
     return provenance
 
 
-def route_onnx_provenance(source: Path, route: str, imgsz: int, python_exe: str) -> dict:
+def route_onnx_provenance(
+    source: Path,
+    route: str,
+    imgsz: StaticInputShape,
+    python_exe: str,
+    data_yaml: Path | None = None,
+) -> dict:
     """构造 FP32 route ONNX 的来源指纹。"""
-    return {
+    provenance = {
         "schema": 1,
         "source_sha256": file_sha256(source),
         "route": route,
-        "imgsz": imgsz,
+        "imgsz": serialize_static_imgsz(imgsz),
         "python": str(Path(python_exe).resolve()),
         "pipeline_sha256": pipeline_sha256(),
     }
+    if data_yaml is not None:
+        provenance["data_sha256"] = file_sha256(data_yaml)
+    return provenance
 
 
 def is_prepared_seg_onnx(path: Path, python_exe: str, expected_route: str) -> bool:
@@ -261,7 +295,8 @@ def resolve_task_and_route(
 def step_fp32_onnx(
     weights_path: Path,
     framework: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
+    data_yaml: Path,
     out_dir: Path,
     base_stem: str,
     python_exe: str,
@@ -284,8 +319,9 @@ def step_fp32_onnx(
     @return 导出的 FP32 ONNX 文件路径。
     """
     fp32_label = fp32_label_for_route(route)
-    target = out_dir / f"{base_stem}_{framework}_{fp32_label}_fp32_{imgsz}.onnx"
-    provenance = route_onnx_provenance(weights_path, fp32_label, imgsz, python_exe)
+    shape_tag = format_static_imgsz(imgsz)
+    target = out_dir / f"{base_stem}_{framework}_{fp32_label}_fp32_{shape_tag}.onnx"
+    provenance = route_onnx_provenance(weights_path, fp32_label, imgsz, python_exe, data_yaml)
     if cache_matches(target, provenance):
         log(f"FP32 ONNX 来源一致，跳过: {target.name}")
         return target
@@ -295,8 +331,10 @@ def step_fp32_onnx(
         str(ROOT / "export" / "export_fp32_onnx.py"),
         "--weights",
         str(weights_path),
+        "--data",
+        str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        shape_tag,
         "--output",
         str(target),
     ]
@@ -318,7 +356,7 @@ def fp32_label_for_route(route: str) -> str:
 def step_int8_onnx_det(
     src_weights: Path,
     framework: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     data_yaml: Path,
     out_dir: Path,
     base_stem: str,
@@ -329,7 +367,8 @@ def step_int8_onnx_det(
     """!
     @brief detection 模型走 quant.quantize.py 生成 INT8 ONNX（pre_dist / pre_dfl）。
     """
-    target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.onnx"
+    shape_tag = format_static_imgsz(imgsz)
+    target = out_dir / f"{base_stem}_{framework}_{route}_int8_{shape_tag}.onnx"
     provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "onnx")
     if cache_matches(target, provenance) and is_prepared_det_onnx(target, python_exe, route):
         log(f"INT8 ONNX 来源与 route 一致，跳过: {target.name}")
@@ -347,7 +386,7 @@ def step_int8_onnx_det(
         "--data",
         str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        shape_tag,
         "--output",
         str(target),
         "--calib-batches",
@@ -365,7 +404,7 @@ def step_int8_onnx_det(
 def step_int8_onnx_seg(
     src_weights: Path,
     framework: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     data_yaml: Path,
     out_dir: Path,
     base_stem: str,
@@ -376,7 +415,8 @@ def step_int8_onnx_seg(
     """!
     @brief segmentation 模型生成对应模型族契约的 INT8 ONNX。
     """
-    target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.onnx"
+    shape_tag = format_static_imgsz(imgsz)
+    target = out_dir / f"{base_stem}_{framework}_{route}_int8_{shape_tag}.onnx"
     provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "onnx")
     if cache_matches(target, provenance) and is_prepared_seg_onnx(target, python_exe, route):
         log(f"INT8 SEG ONNX 已存在，跳过: {target.name}")
@@ -392,7 +432,7 @@ def step_int8_onnx_seg(
         "--data",
         str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        shape_tag,
         "--output",
         str(target),
         "--calib-batches",
@@ -409,7 +449,7 @@ def step_int8_onnx_seg(
 def step_seg_fp32_route_onnx(
     src_weights: Path,
     framework: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     data_yaml: Path,
     out_dir: Path,
     base_stem: str,
@@ -419,8 +459,9 @@ def step_seg_fp32_route_onnx(
     """!
     @brief 为 Seg RKNN 编译准备量化前的 route FP32 ONNX。
     """
-    target = out_dir / f"{base_stem}_{framework}_{route}_fp32_{imgsz}.onnx"
-    provenance = route_onnx_provenance(src_weights, route, imgsz, python_exe)
+    shape_tag = format_static_imgsz(imgsz)
+    target = out_dir / f"{base_stem}_{framework}_{route}_fp32_{shape_tag}.onnx"
+    provenance = route_onnx_provenance(src_weights, route, imgsz, python_exe, data_yaml)
     if cache_matches(target, provenance) and is_prepared_seg_onnx(target, python_exe, route):
         log(f"FP32 SEG route ONNX 已存在，跳过: {target.name}")
         return target
@@ -435,7 +476,7 @@ def step_seg_fp32_route_onnx(
         "--data",
         str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        shape_tag,
         "--prepared-output",
         str(target),
         "--skip-quant",
@@ -453,7 +494,8 @@ def step_seg_fp32_route_onnx(
 def step_fp32predist_onnx_det(
     weights_path: Path,
     framework: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
+    data_yaml: Path,
     out_dir: Path,
     base_stem: str,
     route: str,
@@ -470,8 +512,9 @@ def step_fp32predist_onnx_det(
     @param python_exe 调用时使用的 Python 可执行文件路径。
     @return 输出 ONNX 文件路径。
     """
-    target = out_dir / f"{base_stem}_{framework}_{route}_fp32_{imgsz}.onnx"
-    provenance = route_onnx_provenance(weights_path, route, imgsz, python_exe)
+    shape_tag = format_static_imgsz(imgsz)
+    target = out_dir / f"{base_stem}_{framework}_{route}_fp32_{shape_tag}.onnx"
+    provenance = route_onnx_provenance(weights_path, route, imgsz, python_exe, data_yaml)
     if cache_matches(target, provenance) and is_prepared_det_onnx(target, python_exe, route):
         log(f"{route} FP32 ONNX 来源与 route 一致，跳过: {target.name}")
         return target
@@ -481,8 +524,10 @@ def step_fp32predist_onnx_det(
         str(ROOT / "export" / "export_predist_fp32_onnx.py"),
         "--weights",
         str(weights_path),
+        "--data",
+        str(data_yaml),
         "--imgsz",
-        str(imgsz),
+        shape_tag,
         "--output",
         str(target),
     ]
@@ -497,7 +542,7 @@ def step_fp32predist_onnx_det(
 def step_rknn_int8(
     src_weights: Path,
     framework: str,
-    imgsz: int,
+    imgsz: StaticInputShape,
     data_yaml: Path,
     out_dir: Path,
     base_stem: str,
@@ -509,7 +554,8 @@ def step_rknn_int8(
     """!
     @brief 调用 export_det_rknn_i8 / export_seg_rknn_i8 生成 RKNN INT8。
     """
-    target = out_dir / f"{base_stem}_{framework}_{route}_int8_{imgsz}.rknn"
+    shape_tag = format_static_imgsz(imgsz)
+    target = out_dir / f"{base_stem}_{framework}_{route}_int8_{shape_tag}.rknn"
     provenance = export_provenance(src_weights, data_yaml, route, imgsz, calib_images, python_exe, "rknn")
     if cache_matches(target, provenance):
         log(f"RKNN INT8 来源一致，跳过: {target.name}")
@@ -526,7 +572,7 @@ def step_rknn_int8(
             "--data",
             str(data_yaml),
             "--imgsz",
-            str(imgsz),
+            shape_tag,
             "--output",
             str(target),
             "--calib-images",
@@ -543,7 +589,7 @@ def step_rknn_int8(
             "--data",
             str(data_yaml),
             "--imgsz",
-            str(imgsz),
+            shape_tag,
             "--mode",
             "int8",
             "--output",
@@ -583,7 +629,7 @@ def parse_args() -> argparse.Namespace:
         choices=["predist", "predfl", "seg_predist", "seg_predfl"],
         help="显式指定导出 route",
     )
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument(
         "--calib-images",
         type=int,
@@ -605,7 +651,7 @@ def main() -> int:
     out_dir = Path(args.out).resolve() if args.out else weights_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     data_yaml = Path(args.data).resolve()
-    imgsz = args.imgsz
+    imgsz = normalize_static_imgsz(args.imgsz)
     base_stem = base_stem_for_weights(weights_path)
     paddle_python = resolve_python(args.python_paddle)
     rknn_python = resolve_python(args.python_rknn)
@@ -621,7 +667,7 @@ def main() -> int:
         raise ValueError("Paddle-only 导出不支持这些步骤: " + ", ".join(sorted(unsupported_steps)))
 
     if "onnx_paddle" in steps:
-        step_fp32_onnx(weights_path, "paddle", imgsz, out_dir, base_stem, paddle_python, route)
+        step_fp32_onnx(weights_path, "paddle", imgsz, data_yaml, out_dir, base_stem, paddle_python, route)
 
     if task == "detect":
         if "int8onnx_paddle" in steps:
@@ -637,7 +683,9 @@ def main() -> int:
                 args.calib_images,
             )
         if "fp32predist_paddle" in steps:
-            step_fp32predist_onnx_det(weights_path, "paddle", imgsz, out_dir, base_stem, route, paddle_python)
+            step_fp32predist_onnx_det(
+                weights_path, "paddle", imgsz, data_yaml, out_dir, base_stem, route, paddle_python
+            )
     else:
         if "int8onnx_paddle" in steps:
             step_int8_onnx_seg(
@@ -659,7 +707,7 @@ def main() -> int:
             )
         else:
             rknn_paddle_src = step_fp32predist_onnx_det(
-                weights_path, "paddle", imgsz, out_dir, base_stem, route, paddle_python
+                weights_path, "paddle", imgsz, data_yaml, out_dir, base_stem, route, paddle_python
             )
         step_rknn_int8(
             rknn_paddle_src,

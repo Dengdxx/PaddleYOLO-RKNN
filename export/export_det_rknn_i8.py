@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 from export.det_onnx_routes import cleanup_temp_paths, prepare_det_onnx_i8_input
 from export.export_rknn import _save_calib_dataset, prepare_onnx
+from export.input_shape import StaticInputShape, format_static_imgsz, normalize_static_imgsz
 
 from quant.quantize import auto_export_onnx
 
@@ -37,11 +38,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="一步导出 det RKNN（内部仅走 pre_dist / pre_dfl）")
     p.add_argument("--weights", required=True, help="输入权重路径（.pdparams / onnx）")
     p.add_argument("--route", choices=["predist", "predfl"], help="要求的部署 route；不匹配时拒绝编译")
-    p.add_argument("--data", default=None, help="校准数据集 YAML（仅 int8 模式需要）")
+    p.add_argument(
+        "--data",
+        required=True,
+        help="数据集 YAML；用于 INT8 校准以及生成可信类别名 manifest",
+    )
     p.add_argument("--output", default=None, help="输出 .rknn 路径")
     p.add_argument("--mode", default="int8", choices=["fp16", "int8"], help="导出模式")
     p.add_argument("--target", default="rk3588", choices=["rk3588", "rk3588s", "rk3576", "rk3562"])
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", nargs="+", default=["640"], metavar="SIZE", help="输入尺寸：SIZE、HxW 或 H W")
     p.add_argument("--calib-images", type=int, default=50)
     p.add_argument("--calib-offset", type=int, default=0, help="校准图片起始偏移，用于避免与评测集重叠")
     p.add_argument("--algorithm", default="auto", choices=["auto", "normal", "mmse", "kl_divergence"])
@@ -67,7 +72,7 @@ def default_algorithm(route: str, requested: str) -> str:
     return "mmse" if route == "pre_dist" else "normal"
 
 
-def default_output_path(weights_path: str, route: str, mode: str, imgsz: int) -> str:
+def default_output_path(weights_path: str, route: str, mode: str, imgsz: StaticInputShape) -> str:
     """!
     @brief 生成默认 RKNN 输出路径。
     @param weights_path 用户输入权重路径。
@@ -84,7 +89,8 @@ def default_output_path(weights_path: str, route: str, mode: str, imgsz: int) ->
     route_tag = "predfl" if route == "pre_dfl" else "predist"
     base = stem.split("_paddle_", 1)[0]
     precision = "fp16" if mode == "fp16" else "int8"
-    return str((p.parent / f"{base}_paddle_{route_tag}_{precision}_{imgsz}.rknn").resolve())
+    shape_tag = format_static_imgsz(imgsz)
+    return str((p.parent / f"{base}_paddle_{route_tag}_{precision}_{shape_tag}.rknn").resolve())
 
 
 def build_rknn(
@@ -92,7 +98,7 @@ def build_rknn(
     output_path: str,
     mode: str,
     data_yaml: str | None,
-    imgsz: int,
+    imgsz: StaticInputShape,
     target: str,
     calib_images: int,
     algorithm: str,
@@ -169,10 +175,11 @@ def main() -> int:
     @return 成功返回 `0`。
     """
     args = parse_args()
+    imgsz = normalize_static_imgsz(args.imgsz)
 
     route, prepared_onnx_path, cleanup_paths = prepare_det_onnx_i8_input(
         str(args.weights),
-        args.imgsz,
+        imgsz,
         auto_export_onnx,
     )
     public_route = "predfl" if route == "pre_dfl" else "predist"
@@ -186,7 +193,7 @@ def main() -> int:
         if fixed_onnx != prepared_onnx_path:
             cleanup_paths.append(fixed_onnx)
 
-        output_path = args.output or default_output_path(str(args.weights), route, args.mode, args.imgsz)
+        output_path = args.output or default_output_path(str(args.weights), route, args.mode, imgsz)
         tag = "DET-RKNN-FP16" if args.mode == "fp16" else "DET-RKNN-I8"
         print(f"[{tag}] route={route} mode={args.mode} algorithm={algorithm}")
         print(f"[{tag}] onnx={fixed_onnx}")
@@ -202,7 +209,7 @@ def main() -> int:
                 output_path,
                 args.mode,
                 args.data,
-                args.imgsz,
+                imgsz,
                 args.target,
                 args.calib_images,
                 algorithm,
@@ -210,7 +217,11 @@ def main() -> int:
                 auto_hybrid=args.auto_hybrid,
                 calib_offset=args.calib_offset,
             )
+        from export.model_manifest import write_model_manifest
+
+        manifest_path = write_model_manifest(output_path, fixed_onnx, public_route, imgsz, data_yaml=args.data)
         print(f"[{tag}] 完成: {output_path}")
+        print(f"[{tag}] 清单: {manifest_path}")
         return 0
     finally:
         cleanup_temp_paths(cleanup_paths)

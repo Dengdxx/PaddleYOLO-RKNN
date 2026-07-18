@@ -190,7 +190,9 @@ class SegmentationPredictor(DetectionPredictor):
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
         if masks is not None:
             # 仅保留有效掩码的预测（掩码最大值 > 0）
-            keep = masks.reshape([masks.shape[0], -1]).max(axis=-1) > 0
+            # `process_mask` 为节省内存返回 uint8；Paddle GPU 没有 uint8 reduce-max
+            # kernel，先转 int32 保持 CPU/GPU 后端行为一致。
+            keep = paddle.cast(masks.reshape([masks.shape[0], -1]), "int32").max(axis=-1) > 0
             if not keep.all():
                 pred, masks = pred[keep], masks[keep]
         return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], masks=masks)
