@@ -511,8 +511,12 @@ class Model(paddle.nn.Module):
         """
         self._check_is_paddle_model()
         checks.check_pip_update_available()
+        pretrained_weights = None
         if isinstance(kwargs.get("pretrained", None), (str, Path)):
-            self.load(kwargs["pretrained"])
+            # 先保留原始 checkpoint 模型，待 trainer 读取数据集类别数后再迁移。
+            # 若此处提前加载到 YAML 默认类别数模型，类别相关 head 会因形状不匹配被丢弃，
+            # 后续 trainer 只能从已损坏的中间模型继续构建目标模型。
+            pretrained_weights, _ = load_checkpoint(kwargs["pretrained"])
         overrides = YAML.load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
         custom = {
             "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
@@ -529,7 +533,8 @@ class Model(paddle.nn.Module):
             args["resume"] = self.ckpt_path
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):
-            self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+            weights = pretrained_weights if pretrained_weights is not None else (self.model if self.ckpt else None)
+            self.trainer.model = self.trainer.get_model(weights=weights, cfg=self.model.yaml)
             self.model = self.trainer.model
         self.trainer.train()
         if RANK in {-1, 0}:
@@ -739,7 +744,7 @@ class Model(paddle.nn.Module):
             >>> print(reset_args)
             {'imgsz': 640, 'data': 'coco.yaml', 'task': 'detect'}
         """
-        include = {"imgsz", "data", "task", "single_cls"}
+        include = {"imgsz", "data", "task", "single_cls", "overlap_mask", "mask_ratio"}
         return {k: v for k, v in args.items() if k in include}
 
     def _smart_load(self, key: str):

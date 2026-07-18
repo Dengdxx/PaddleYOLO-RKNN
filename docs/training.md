@@ -212,6 +212,9 @@ metrics = model.val(
 print(metrics.box.map50, metrics.box.map)
 ```
 
+分割 checkpoint 会自动恢复训练时的 `overlap_mask` 和 `mask_ratio`
+标注语义；只有在评测不同标注格式时才需要显式覆盖。
+
 ## 推理
 
 ```python
