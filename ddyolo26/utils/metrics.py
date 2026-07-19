@@ -792,8 +792,11 @@ def compute_ap(recall: list[float], precision: list[float]) -> tuple[float, np.n
         mpre (np.ndarray): precision envelope curve。
         mrec (np.ndarray): 在首尾添加 sentinel values 后的 modified recall curve。
     """
-    mrec = np.concatenate(([0.0], recall, [1.0]))
-    mpre = np.concatenate(([1.0], precision, [0.0]))
+    # 与最新版 Ultralytics 对齐：在真实最大 recall 位置先把 precision
+    # 降到 0，再延伸到 recall=1。旧实现直接连接到 (1, 0)，会在
+    # 最大 recall 不足 1 时通过插值虚增 PR 曲线尾部面积。
+    mrec = np.concatenate(([0.0], recall, [recall[-1] if len(recall) else 1.0], [1.0]))
+    mpre = np.concatenate(([1.0], precision, [0.0], [0.0]))
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
     method = "interp"
     if method == "interp":
