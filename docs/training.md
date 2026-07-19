@@ -200,14 +200,20 @@ model.train(resume=True)
 ### 知识蒸馏
 
 `tools/distill.py` 会根据 student checkpoint 自动选择检测或分割 trainer。
-YOLO 分类响应按独立 sigmoid 做 Bernoulli KL，验证阶段不执行
-teacher 前向。分割数据集应显式对齐 mask 语义：
+检测与分割任务均蒸馏分类响应及 teacher 置信度加权的三尺度空间特征；
+空间注意力不依赖通道数，因此支持 `s→n` 等跨 scale 蒸馏。分割任务还会
+蒸馏 mask coefficient、Proto 和语义辅助输出。验证阶段不执行 teacher 前向。
+分割数据集应显式对齐 mask 语义：
 
 ```bash
 python tools/distill.py \
   --teacher teacher.pdparams --student student.pdparams \
-  --data data.yaml --optimizer MuSGD --no-overlap-mask
+  --data data.yaml --optimizer MuSGD --no-overlap-mask \
+  --kd-weight 1.0 --feat-weight 0.5 \
+  --mask-weight 0.25 --proto-weight 0.25
 ```
+
+`--mask-weight` 与 `--proto-weight` 在检测任务中自动忽略。
 
 中断后使用 `--resume runs/.../weights/last.pdparams` 恢复原始模型、
 EMA、优化器和 AMP scaler。

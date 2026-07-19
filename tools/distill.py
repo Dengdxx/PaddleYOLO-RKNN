@@ -5,8 +5,9 @@
 """YOLO26 知识蒸馏训练脚本
 
 策略：特征蒸馏 + 响应蒸馏（Feature-based + Response-based KD）
-  - FPN 特征图上的 Channel-Wise L2 蒸馏（CWD，对密集预测效果更好）
+  - teacher 置信度加权的 FPN 空间注意力蒸馏（支持不同 scale 通道数）
   - 分类 logits 的温度缩放 KL 散度（Response KD）
+  - 分割任务额外蒸馏 mask coefficient、Proto 和语义辅助输出
   - 遵循官方 E2ELoss 的 one2many/one2one 衰减加权机制
   - 不对框回归做 KD（DFL 分布不适合直接蒸馏，feature KD 已隐式覆盖）
 
@@ -66,6 +67,12 @@ from export.input_shape import normalize_static_imgsz
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _prediction_branches(preds: dict) -> list[dict]:
+    """返回模型中可用于蒸馏的预测分支，兼容 E2E 与普通检测头。"""
+    branches = [preds[key] for key in ("one2one", "one2many") if key in preds]
+    return branches or [preds]
+
+
 def _logit_kd_loss(s_preds: dict, t_preds: dict, temperature: float = 4.0) -> paddle.Tensor:
     """
     分类 logits 二元响应蒸馏。
@@ -89,11 +96,12 @@ def _logit_kd_loss(s_preds: dict, t_preds: dict, temperature: float = 4.0) -> pa
     T = temperature
     kd = paddle.zeros([1])
 
-    for head_key in ("one2one", "one2many"):
-        if head_key not in s_preds or head_key not in t_preds:
+    n_matched = 0
+    for s_branch, t_branch in zip(_prediction_branches(s_preds), _prediction_branches(t_preds)):
+        if "scores" not in s_branch or "scores" not in t_branch:
             continue
-        s_scores = s_preds[head_key]["scores"]  # [B, NC, NA]
-        t_scores = t_preds[head_key]["scores"]  # [B, NC, NA]
+        s_scores = s_branch["scores"]  # [B, NC, NA]
+        t_scores = t_branch["scores"]  # [B, NC, NA]
 
         # YOLO 各类别是独立 sigmoid，不能按互斥类别做 softmax KL。
         # mean 同时对 batch、anchor 和 class 归一化，避免 KD 随输入尺寸放大。
@@ -102,19 +110,32 @@ def _logit_kd_loss(s_preds: dict, t_preds: dict, temperature: float = 4.0) -> pa
         teacher_entropy = F.binary_cross_entropy_with_logits(t_scores.detach() / T, t_prob, reduction="mean")
         cls_kd = (cross_entropy - teacher_entropy) * (T**2)
         kd = kd + cls_kd
+        n_matched += 1
 
-    return kd
+    return kd / max(n_matched, 1)
 
 
-def _feature_kd_loss(s_feats: list, t_feats: list) -> paddle.Tensor:
+def _teacher_score_weights(t_preds: dict, t_feats: list) -> list[paddle.Tensor]:
+    """按特征层拆分 teacher 置信度，生成 Ultralytics 风格的空间权重。"""
+    import paddle
+
+    branch_scores = [branch["scores"] for branch in _prediction_branches(t_preds) if "scores" in branch]
+    if not branch_scores:
+        return [paddle.ones([feat.shape[0], 1, feat.shape[2], feat.shape[3]]) for feat in t_feats]
+    scores = paddle.stack(branch_scores, axis=0).mean(axis=0).detach().sigmoid().max(axis=1, keepdim=True)
+    sizes = [int(feat.shape[2] * feat.shape[3]) for feat in t_feats]
+    parts = paddle.split(scores, sizes, axis=-1)
+    return [part.reshape([part.shape[0], 1, feat.shape[2], feat.shape[3]]) for part, feat in zip(parts, t_feats)]
+
+
+def _feature_kd_loss(s_feats: list, t_feats: list, score_weights: list[paddle.Tensor]) -> paddle.Tensor:
     """
     FPN 特征图 Channel-Wise 归一化 L2 蒸馏（CWD 简化版）。
 
-    对每个 FPN 层级的特征图做 channel 维 L2 归一化后计算 MSE，
-    这样不同 channel 数的 teacher/student 也能通过 1x1 适配层对齐。
-
-    但由于 YOLO26 同系列模型 FPN 通道数随 scale 变化，
-    此处仅在 s/t 通道数一致时直接匹配，否则跳过该层。
+    对每个 FPN 层级沿通道聚合平方响应，形成与通道数无关的空间注意力图。
+    因此 n/s/m 等不同 scale 可直接蒸馏，不再因通道数不同而整层跳过。
+    空间误差由 teacher 的 O2O/O2M 分类置信度加权，与最新版 Ultralytics
+    score-weighted feature distillation 的目标一致。
 
     参数:
         s_feats: student FPN 特征列表 [P3, P4, P5]
@@ -129,23 +150,71 @@ def _feature_kd_loss(s_feats: list, t_feats: list) -> paddle.Tensor:
     feat_loss = paddle.zeros([1])
     n_matched = 0
 
-    for sf, tf in zip(s_feats, t_feats):
-        if sf.shape[1] != tf.shape[1]:
-            # 通道数不同（teacher/student 不同 scale），跳过
-            continue
+    for sf, tf, weight in zip(s_feats, t_feats, score_weights):
         # Spatial 尺寸可能不同（不同 batch rect padding），对齐
         if sf.shape[2:] != tf.shape[2:]:
             tf = F.interpolate(tf, size=sf.shape[2:], mode="bilinear", align_corners=False)
 
-        # Channel-wise L2 归一化
-        sf_norm = F.normalize(sf, p=2, axis=1)  # [B, C, H, W]
-        tf_norm = F.normalize(tf.detach(), p=2, axis=1)
-        feat_loss = feat_loss + F.mse_loss(sf_norm, tf_norm, reduction="mean")
+        sf_attention = sf.square().mean(axis=1, keepdim=True)
+        tf_attention = tf.detach().square().mean(axis=1, keepdim=True)
+        sf_attention = F.normalize(sf_attention.flatten(1), p=2, axis=1).reshape(sf_attention.shape)
+        tf_attention = F.normalize(tf_attention.flatten(1), p=2, axis=1).reshape(tf_attention.shape)
+        weight = weight.astype(sf_attention.dtype)
+        feat_loss = feat_loss + ((sf_attention - tf_attention).square() * weight).sum() / (weight.sum() + 1e-9)
         n_matched += 1
 
     if n_matched > 0:
         feat_loss = feat_loss / n_matched
     return feat_loss
+
+
+def _segmentation_kd_loss(
+    s_preds: dict,
+    t_preds: dict,
+    temperature: float = 4.0,
+) -> tuple[paddle.Tensor, paddle.Tensor]:
+    """计算 mask coefficient 与 Proto/语义辅助头蒸馏损失。"""
+    import paddle
+    import paddle.nn.functional as F
+
+    coefficient_loss = paddle.zeros([1])
+    n_coeff = 0
+    for s_branch, t_branch in zip(_prediction_branches(s_preds), _prediction_branches(t_preds)):
+        if "mask_coefficient" not in s_branch or "mask_coefficient" not in t_branch:
+            continue
+        s_coeff = s_branch["mask_coefficient"]
+        t_coeff = t_branch["mask_coefficient"].detach()
+        confidence = t_branch["scores"].detach().sigmoid().max(axis=1, keepdim=True)
+        raw = F.smooth_l1_loss(s_coeff, t_coeff, reduction="none")
+        coefficient_loss += (raw * confidence).sum() / (confidence.sum() * s_coeff.shape[1] + 1e-9)
+        n_coeff += 1
+    coefficient_loss /= max(n_coeff, 1)
+
+    s_branch = _prediction_branches(s_preds)[-1]
+    t_branch = _prediction_branches(t_preds)[-1]
+    if "proto" not in s_branch or "proto" not in t_branch:
+        return coefficient_loss, paddle.zeros([1])
+    s_proto, t_proto = s_branch["proto"], t_branch["proto"]
+    s_semseg = t_semseg = None
+    if isinstance(s_proto, tuple):
+        s_proto, s_semseg = s_proto
+    if isinstance(t_proto, tuple):
+        t_proto, t_semseg = t_proto
+    if tuple(s_proto.shape[-2:]) != tuple(t_proto.shape[-2:]):
+        t_proto = F.interpolate(t_proto, size=s_proto.shape[-2:], mode="bilinear", align_corners=False)
+    proto_loss = F.mse_loss(
+        F.normalize(s_proto.flatten(2), p=2, axis=2),
+        F.normalize(t_proto.detach().flatten(2), p=2, axis=2),
+        reduction="mean",
+    )
+    if s_semseg is not None and t_semseg is not None:
+        if tuple(s_semseg.shape[-2:]) != tuple(t_semseg.shape[-2:]):
+            t_semseg = F.interpolate(t_semseg, size=s_semseg.shape[-2:], mode="bilinear", align_corners=False)
+        teacher_prob = F.sigmoid(t_semseg.detach() / temperature)
+        cross_entropy = F.binary_cross_entropy_with_logits(s_semseg / temperature, teacher_prob)
+        teacher_entropy = F.binary_cross_entropy_with_logits(t_semseg.detach() / temperature, teacher_prob)
+        proto_loss += (cross_entropy - teacher_entropy) * (temperature**2)
+    return coefficient_loss, proto_loss
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -178,6 +247,8 @@ class DistillDetectionTrainer:
         teacher_weights: str,
         kd_weight: float = 1.0,
         feat_weight: float = 0.5,
+        mask_weight: float = 0.25,
+        proto_weight: float = 0.25,
         temperature: float = 4.0,
         overrides: dict = None,
     ):
@@ -187,12 +258,16 @@ class DistillDetectionTrainer:
             teacher_weights: Teacher 模型权重文件路径
             kd_weight: Logit KD 损失权重（KL 散度）
             feat_weight: 特征图 KD 损失权重（CWD-L2）
+            mask_weight: mask coefficient KD 损失权重
+            proto_weight: Proto 与语义辅助头 KD 损失权重
             temperature: KD 温度参数，越大 soft label 越平滑
             overrides: 传递给 DetectionTrainer 的配置覆盖
         """
         self.teacher_weights = teacher_weights
         self.kd_weight = kd_weight
         self.feat_weight = feat_weight
+        self.mask_weight = mask_weight
+        self.proto_weight = proto_weight
         self.temperature = temperature
         self.overrides = overrides or {}
         self._teacher = None
@@ -207,6 +282,7 @@ class DistillDetectionTrainer:
             checkpoint, _ = paddle_safe_load(student)
             task = guess_model_task(checkpoint.get("yaml", checkpoint.get("train_args", {})))
         task = task or guess_model_task(student)
+        self.task = task
         trainer_cls = SegmentationTrainer if task == "segment" else DetectionTrainer
         self._trainer = trainer_cls(overrides=self.overrides)
         self._trainer.add_callback("on_pretrain_routine_end", self._inject_distill)
@@ -221,7 +297,7 @@ class DistillDetectionTrainer:
         LOGGER.info(f"[KD] 加载 teacher 模型: {self.teacher_weights}")
         ckpt = paddle.load(str(self.teacher_weights))
 
-        from ddyolo26.nn.tasks import DetectionModel, yaml_model_load
+        from ddyolo26.nn.tasks import DetectionModel, SegmentationModel, yaml_model_load
         import re as _re
 
         yaml_cfg = ckpt.get("yaml") if isinstance(ckpt, dict) else None
@@ -239,7 +315,8 @@ class DistillDetectionTrainer:
         elif isinstance(yaml_cfg, dict) and teacher_scale:
             yaml_cfg.setdefault("scale", teacher_scale)
 
-        teacher = DetectionModel(
+        teacher_cls = SegmentationModel if self.task == "segment" else DetectionModel
+        teacher = teacher_cls(
             cfg=yaml_cfg or "ddyolo26/cfg/models/26/yolo26.yaml",
             nc=trainer.data["nc"],
             ch=trainer.data.get("channels", 3),
@@ -269,7 +346,10 @@ class DistillDetectionTrainer:
             p.stop_gradient = True
         teacher = teacher.to(trainer.device)
         self._teacher = teacher
-        LOGGER.info(f"[KD] Teacher 已冻结。logit_kd={self.kd_weight}, feat_kd={self.feat_weight}, T={self.temperature}")
+        LOGGER.info(
+            f"[KD] Teacher 已冻结。logit_kd={self.kd_weight}, feat_kd={self.feat_weight}, "
+            f"mask_kd={self.mask_weight}, proto_kd={self.proto_weight}, T={self.temperature}"
+        )
 
         # ── 注入 KD criterion ─────────────────────────────────────────
         student_model = unwrap_model(trainer.model)
@@ -280,6 +360,8 @@ class DistillDetectionTrainer:
         base_criterion = student_model.criterion
         kd_w = self.kd_weight
         feat_w = self.feat_weight
+        mask_w = self.mask_weight
+        proto_w = self.proto_weight
         temperature = self.temperature
         teacher_ref = teacher
 
@@ -310,13 +392,19 @@ class DistillDetectionTrainer:
                 logit_loss = _logit_kd_loss(s_preds, t_preds, temperature) if kd_w > 0 else paddle.zeros([1])
                 feat_loss = paddle.zeros([1])
                 if feat_w > 0:
-                    for head_key in ("one2many",):
-                        s_feats = s_preds.get(head_key, {}).get("feats", [])
-                        t_feats = t_preds.get(head_key, {}).get("feats", [])
-                        if s_feats and t_feats:
-                            feat_loss = feat_loss + _feature_kd_loss(s_feats, t_feats)
+                    s_branch = _prediction_branches(s_preds)[-1]
+                    t_branch = _prediction_branches(t_preds)[-1]
+                    s_feats = s_branch.get("feats", [])
+                    t_feats = t_branch.get("feats", [])
+                    if s_feats and t_feats:
+                        score_weights = _teacher_score_weights(t_preds, t_feats)
+                        feat_loss = _feature_kd_loss(s_feats, t_feats, score_weights)
 
-                kd_total = kd_w * logit_loss + feat_w * feat_loss
+                mask_loss = proto_loss = paddle.zeros([1])
+                if self.task == "segment" and (mask_w > 0 or proto_w > 0):
+                    mask_loss, proto_loss = _segmentation_kd_loss(s_preds, t_preds, temperature)
+
+                kd_total = kd_w * logit_loss + feat_w * feat_loss + mask_w * mask_loss + proto_w * proto_loss
                 combined_loss = paddle.concat([task_loss, kd_total.reshape([1])])
                 combined_items = paddle.concat([task_items, kd_total.detach().reshape([1])])
                 return combined_loss, combined_items
@@ -395,7 +483,19 @@ def parse_args():
         "--feat-weight",
         type=float,
         default=0.5,
-        help="Feature KD 权重（FPN feats 上的 CWD-L2，默认 0.5）",
+        help="Feature KD 权重（置信度加权空间注意力，默认 0.5）",
+    )
+    parser.add_argument(
+        "--mask-weight",
+        type=float,
+        default=0.25,
+        help="分割 mask coefficient KD 权重（检测任务自动忽略，默认 0.25）",
+    )
+    parser.add_argument(
+        "--proto-weight",
+        type=float,
+        default=0.25,
+        help="分割 Proto/语义辅助头 KD 权重（检测任务自动忽略，默认 0.25）",
     )
     parser.add_argument(
         "--temperature",
@@ -440,6 +540,8 @@ if __name__ == "__main__":
     print(f"  Epoch 数:     {args.epochs}")
     print(f"  Logit KD:     {args.kd_weight}")
     print(f"  Feature KD:   {args.feat_weight}")
+    print(f"  Mask KD:      {args.mask_weight}")
+    print(f"  Proto KD:     {args.proto_weight}")
     print(f"  温度:         {args.temperature}")
     print(f"  输出:         {args.output}")
     print("=" * 65)
@@ -475,6 +577,8 @@ if __name__ == "__main__":
         teacher_weights=args.teacher,
         kd_weight=args.kd_weight,
         feat_weight=args.feat_weight,
+        mask_weight=args.mask_weight,
+        proto_weight=args.proto_weight,
         temperature=args.temperature,
         overrides=overrides,
     )
